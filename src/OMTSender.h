@@ -78,6 +78,12 @@ struct SenderConfig {
     std::string name = "OMT Sender";
     Quality quality = Quality::Default;
     int port = Constants::NETWORK_PORT_START;
+    // Phase C: which local IPv4 address to bind the TCP listener to. "0.0.0.0"
+    // (the default, and the canonical value for "auto") binds all interfaces
+    // (INADDR_ANY); an explicit dotted-quad binds ONE interface so a multi-NIC
+    // host streams out a chosen adapter. An unparseable value makes start()
+    // fail-closed (visible) rather than silently falling back to all interfaces.
+    std::string bindAddress = "0.0.0.0";
     int sendBufferSize = Constants::NETWORK_SEND_BUFFER;  // Official: 65536 (64KB)
     // P0 #19: per-channel async send pool depth. Default keeps the proven
     // libomtnet value (NETWORK_ASYNC_COUNT=4); tunable down (less memory) or up

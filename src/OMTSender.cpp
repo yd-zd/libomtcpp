@@ -62,11 +62,25 @@ bool Sender::start() {
     
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    // Phase C: bind to the configured local IPv4. Empty / "0.0.0.0" / "auto"
+    // means all interfaces (INADDR_ANY). Any other value must parse as a dotted
+    // quad or we fail-closed (visible) — silently falling back to all interfaces
+    // would defeat the point of choosing an adapter on a multi-NIC host.
+    const std::string& bindAddr = config_.bindAddress;
+    if (bindAddr.empty() || bindAddr == "0.0.0.0" || bindAddr == "auto") {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    } else if (::inet_pton(AF_INET, bindAddr.c_str(), &addr.sin_addr) != 1) {
+        LOGE("Sender: invalid bind address '%s' (errno=%d %s) — refusing to start",
+             bindAddr.c_str(), errno, std::strerror(errno));
+        close(ss);
+        serverSocket_ = -1;
+        return false;
+    }
     addr.sin_port = htons(config_.port);
     
     if (bind(ss, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOGE("Sender: failed to bind port %d errno=%d (%s)", config_.port, errno, std::strerror(errno));
+        LOGE("Sender: failed to bind %s:%d errno=%d (%s)",
+             bindAddr.empty() ? "0.0.0.0" : bindAddr.c_str(), config_.port, errno, std::strerror(errno));
         close(ss);
         serverSocket_ = -1;
         return false;
