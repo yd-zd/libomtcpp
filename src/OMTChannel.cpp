@@ -30,20 +30,41 @@
 
 namespace omt {
 
+static_assert(sizeof(FrameHeader) == 16, "FrameHeader wire layout must stay 16 bytes");
+static_assert(sizeof(VideoExtHeader) == 32, "VideoExtHeader wire layout must stay 32 bytes");
+
 namespace {
+// Largest control (Metadata) payload the receive path will parse. metadataLength
+// is uint16 (<=65535); a full metadata frame is 16 + dataLength bytes. recvBuffer
+// is sized for this so a well-formed frame always fits and a larger claim is
+// rejected before it can force a zero-capacity recv().
+constexpr int32_t kMaxControlPayload = 65535;
+
 // Poll-driven non-blocking full send. Blocking semantics WITHOUT touching the
 // shared fd flags (no fcntl(F_SETFL) anywhere): POLLOUT readiness + MSG_DONTWAIT.
 bool sendAllPoll(int fd, const uint8_t* data, size_t length,
-                 const std::atomic<bool>& alive) {
+                 const std::atomic<bool>& alive, int timeoutMs = 5000) {
     size_t off = 0;
+    // P0 #7 (Codex): bound the write. A peer that accepts the socket but never
+    // reads keeps poll() returning 0 forever (alive stays true), so an unbounded
+    // loop would hang the caller — and for the SYNC metadata path, the caller
+    // holds channelsMutex_ across this, stalling the whole sender. Fail after a
+    // deadline instead so the channel can be torn down.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeoutMs);
     while (off < length && alive.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOGW("sendAllPoll: timed out after %d ms at %zu/%zu bytes (peer not draining)",
+                 timeoutMs, off, length);
+            return false;
+        }
         struct pollfd pfd{fd, POLLOUT, 0};
         const int pr = poll(&pfd, 1, 100);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        if (pr == 0) continue;  // timeout — re-check alive
+        if (pr == 0) continue;  // timeout — re-check alive + deadline
         const ssize_t n = ::send(fd, data + off, length - off,
                                  MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n > 0) { off += static_cast<size_t>(n); continue; }
@@ -56,8 +77,13 @@ bool sendAllPoll(int fd, const uint8_t* data, size_t length,
 } // namespace
 
 Channel::Channel(int socketFd, struct sockaddr_in address, 
-                 int sendBufferSize, IChannelListener* listener)
+                 int sendBufferSize, IChannelListener* listener,
+                 int sendQueueCount)
     : socketFd_(socketFd), address_(address), listener_(listener) {
+    // P0 #19: clamp the configurable async send pool depth to a sane range.
+    sendQueueCount_ = (sendQueueCount < 1) ? 1
+                    : (sendQueueCount > 16) ? 16 : sendQueueCount;
+        LOGI("Channel: created on fd=%d (FD_SETSIZE=%d)", socketFd, FD_SETSIZE);
     
     // Non-blocking ONCE at construction; nothing may flip these flags later
     // (sendAllPoll/MSG_DONTWAIT carry the per-call semantics — see 2026-10-13 fix).
@@ -80,9 +106,9 @@ Channel::Channel(int socketFd, struct sockaddr_in address,
     setsockopt(socketFd_, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle));
 #endif
     
-    // Create async send pool
+    // Create async send pool (P0 #19: depth configurable via SenderConfig)
     sendPool_ = std::make_unique<AsyncPool>(
-        Constants::NETWORK_ASYNC_COUNT, 
+        sendQueueCount_, 
         Constants::NETWORK_ASYNC_BUFFER_AV);
     
     // Start threads
@@ -100,9 +126,11 @@ Channel::~Channel() {
     running_ = false;
     connected_ = false;
     
-    // Shutdown socket to unblock threads
-    if (socketFd_ > 0) {
-        shutdown(socketFd_, SHUT_RDWR);
+    // Shutdown socket to unblock threads (do not close yet — threads may still
+    // reference the descriptor; the single close happens below, after joins).
+    const int livefd = socketFd_.load();
+    if (livefd >= 0) {
+        shutdown(livefd, SHUT_RDWR);
     }
     
     queueCV_.notify_all();
@@ -123,16 +151,23 @@ Channel::~Channel() {
         }
     }
     
-    closeSocket();
+    closeSocket(); // P0 #5: the single, final close — after both threads joined
     
     LOGI("Channel: destroyed, sent=%lld, dropped=%lld", 
          (long long)framesSent_.load(), (long long)framesDropped_.load());
 }
 
 void Channel::disconnect() {
+    // P0 #5 (Codex): signal stop and unblock the socket, but do NOT close it
+    // here — the sender/receiver threads may still be using the descriptor, and
+    // another socket could reuse that number. The final owner (~Channel) joins
+    // both threads and closes exactly once.
     connected_ = false;
     running_ = false;
-    closeSocket();
+    const int fd = socketFd_.load();
+    if (fd >= 0)
+        ::shutdown(fd, SHUT_RDWR);
+    queueCV_.notify_all();
 }
 
 void Channel::closeSocket() {
@@ -191,8 +226,38 @@ bool Channel::sendMetadataSync(const char* xml) {
     memcpy(frame.data() + sizeof(FrameHeader), xml, len);
     frame[sizeof(FrameHeader) + len] = 0;
 
-    return sendAllPoll(fd, reinterpret_cast<const uint8_t*>(frame.data()),
-                       frame.size(), connected_);
+    // P0 #7 (Codex): serialize the write across the ENTIRE send (so a concurrent
+    // async video frame cannot interleave bytes with this metadata frame on the
+    // single TCP stream) AND bound the acquisition: the async writer can hold
+    // sendSocketMutex_ for the full sendAllPoll deadline, so we poll try_lock()
+    // until a budget then fail + tear the channel down rather than block forever.
+    // std::mutex::try_lock (not std::timed_mutex) so ThreadSanitizer models the
+    // lock/unlock pairing correctly (timed_mutex's timed path produced spurious
+    // "unlock of an unlocked mutex" reports on this libstdc++).
+    const auto budget = std::chrono::steady_clock::now() + std::chrono::milliseconds(6000);
+    while (!sendSocketMutex_.try_lock()) {
+        if (std::chrono::steady_clock::now() >= budget || !connected_.load()) {
+            LOGW("sendMetadataSync: could not acquire socket-write lock; disconnecting");
+            connected_ = false;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const bool ok = sendAllPoll(fd, reinterpret_cast<const uint8_t*>(frame.data()),
+                                frame.size(), connected_);
+    if (!ok) {
+        // P0 #7 (Codex): a PARTIAL write leaves the TCP stream desynchronized
+        // (half a metadata frame on the wire); reusing it would mis-frame every
+        // subsequent video record. Mark the channel DEAD *while still holding the
+        // write lock*, so a waiting async video writer cannot acquire it in the
+        // gap, observe a still-connected channel, and append video bytes after the
+        // incomplete metadata. Mirrors sendAllBlocking (sets connected_=false under
+        // the lock). Only then release the lock.
+        LOGW("sendMetadataSync: incomplete metadata write; disconnecting channel");
+        connected_ = false;
+    }
+    sendSocketMutex_.unlock();
+    return ok;
 }
 
 int Channel::sendAsync(const void* headerData, size_t headerLen,
@@ -275,6 +340,9 @@ void Channel::senderLoop() {
 bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
     const int fd = socketFd_.load();
     if (fd < 0) return false;
+    // P0 #7 (Codex): same per-channel write lock as sendMetadataSync so the
+    // async video writer and the sync metadata writer never interleave bytes.
+    std::lock_guard<std::mutex> wlock(sendSocketMutex_);
     const bool okSend = sendAllPoll(fd, data, length, connected_);
     if (!okSend)
         connected_ = false;
@@ -284,21 +352,17 @@ bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
 void Channel::receiverLoop() {
     LOGI("receiverLoop: started");
     
-    std::vector<uint8_t> recvBuffer(65536);
+    std::vector<uint8_t> recvBuffer(FrameHeader::SIZE + kMaxControlPayload);
     size_t bufferPos = 0;
     
     while (running_ && connected_) {
         const int fd = socketFd_.load();
         if (fd < 0)
-            break; // socket already closed by ~Channel/disconnect — see FD_SET guard
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(fd, &readfds);
-        
-        struct timeval tv{0, 100000};  // 100ms
-        
-        int sel = select(fd + 1, &readfds, nullptr, nullptr, &tv);
-        
+            break; // socket already closed by ~Channel/disconnect
+        // poll() has no FD_SETSIZE limit — select() corrupted the stack for
+        // fd >= 1024 (proven by ASan socketpair repro, 2026-10-13).
+        struct pollfd pfd{fd, POLLIN, 0};
+        int sel = ::poll(&pfd, 1, 100);  // 100ms tick
         if (sel < 0) {
             if (errno == EINTR) continue;
             connected_ = false;
@@ -307,14 +371,22 @@ void Channel::receiverLoop() {
         
         if (sel == 0) continue;
         
+        // Never call recv() with zero available capacity: a full buffer means a
+        // peer is streaming a frame larger than kMaxControlPayload (already
+        // rejected at parse time) or we failed to drain — treat as malformed.
+        if (bufferPos >= recvBuffer.size()) {
+            LOGE("receiverLoop: receive buffer full (%zu) without a consumable frame", bufferPos);
+            connected_ = false;
+            break;
+        }
         ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
                                 recvBuffer.size() - bufferPos, MSG_DONTWAIT);
         
-        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // Spurious readability after select (consumed by a parallel path
-            // or SO_RCVLOWAT race). NOT a disconnect — keep polling. Treating
-            // EAGAIN as peer-close killed every subscribed channel after the
-            // subscribe message (0 frames + later abort). Measured 2026-10-13.
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            // Spurious readability after poll (consumed by a parallel path or
+            // SO_RCVLOWAT race) OR an interrupted syscall. NOT a disconnect —
+            // keep polling. Treating EAGAIN as peer-close killed every
+            // subscribed channel after the subscribe message. Measured 2026-10-13.
             continue;
         }
         if (received < 0) {
@@ -323,18 +395,18 @@ void Channel::receiverLoop() {
             break;
         }
         if (received == 0) {
-            // Peer closed its WRITE half (pure receivers shutdown(SHUT_WR) after
-            // the subscribe XML). The read half is still valid — WE must keep
-            // sending. Treat as idle, NOT as disconnect. Full close surfaces as
-            // a later send error (sendAllPoll -> connected_=false), and socket
-            // death as recv errors. Verified against omt-recv 2026-10-13.
-            static bool halfCloseLogged = false;
-            if (!halfCloseLogged) {
-                LOGI("receiverLoop: peer write-half closed; keep streaming");
-                halfCloseLogged = true;
+            // P0 #6 (Codex): genuine read-half EOF is a STATE, not a 20ms poll
+            // loop. The peer closed its write half (pure receivers shutdown
+            // (SHUT_WR) after the subscribe XML). Stop reading here but do NOT
+            // mark disconnected — the SEND side (senderLoop) must keep running.
+            // A full close surfaces later as a send error (sendAllPoll ->
+            // connected_=false) and is reclaimed via cleanupDisconnected.
+            // (The old shared `static bool halfCloseLogged` raced across channels.)
+            if (!readEof_) {
+                LOGI("receiverLoop: peer write-half closed (EOF); stopping reads, keep streaming");
+                readEof_ = true;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            continue;
+            break;
         }
         
         bytesReceived_ += received;
@@ -342,28 +414,62 @@ void Channel::receiverLoop() {
         
         // Process complete frames
         while (bufferPos >= FrameHeader::SIZE) {
-            auto* header = reinterpret_cast<FrameHeader*>(recvBuffer.data());
-            
-            if (header->version != 1) {
-                LOGE("receiverLoop: invalid version %d", header->version);
+            // P0 #3 (Codex): copy the header into a local before dereferencing
+            // attacker-controlled fields, and VALIDATE every field BEFORE any
+            // arithmetic. dataLength is signed int32: the old
+            // `size_t total = FrameHeader::SIZE + header->dataLength` was signed
+            // overflow at INT32_MAX, a zero-progress loop at -16 (total==0 never
+            // consumed bytes), and a false half-close when an oversized frame
+            // filled recvBuffer and the next recv(...,0) returned 0.
+            FrameHeader header;
+            std::memcpy(&header, recvBuffer.data(), FrameHeader::SIZE);
+
+            const uint8_t ft = header.frameType;
+            if (header.version != 1) {
+                LOGE("receiverLoop: invalid version %u", header.version);
                 connected_ = false;
                 break;
             }
-            
-            size_t totalFrameLen = FrameHeader::SIZE + header->dataLength;
-            
-            if (totalFrameLen > bufferPos) break;
-            
+            // This is the SENDER's receive path: it only accepts Metadata control
+            // frames (subscribe / quality XML) from a peer. Video/Audio arriving
+            // here are malformed for this direction — reject rather than parse.
+            if (ft != static_cast<uint8_t>(FrameType::Metadata)) {
+                LOGE("receiverLoop: unexpected peer frameType %u", ft);
+                connected_ = false;
+                break;
+            }
+            if (header.dataLength < 0) {
+                LOGE("receiverLoop: negative dataLength %d", header.dataLength);
+                connected_ = false;
+                break;
+            }
+            if (header.dataLength > kMaxControlPayload) {
+                LOGE("receiverLoop: oversized control frame dataLength %d", header.dataLength);
+                connected_ = false;
+                break;
+            }
+            // metadataLength is uint16 and must fit inside dataLength.
+            if (static_cast<int32_t>(header.metadataLength) > header.dataLength) {
+                LOGE("receiverLoop: metadataLength %u > dataLength %d",
+                     header.metadataLength, header.dataLength);
+                connected_ = false;
+                break;
+            }
+
+            const size_t totalFrameLen =
+                static_cast<size_t>(FrameHeader::SIZE) + static_cast<size_t>(header.dataLength);
+
+            if (totalFrameLen > bufferPos) break; // wait for the rest of the frame
+
             // Process metadata
-            if (header->frameType == static_cast<uint8_t>(FrameType::Metadata) && 
-                header->dataLength > 0) {
+            if (header.dataLength > 0) {
                 char* xmlData = reinterpret_cast<char*>(recvBuffer.data() + FrameHeader::SIZE);
                 
                 // Fix for conflicting implementations:
                 // - C# libomtnet sends XML *without* null terminator
                 // - Protocol says null terminated
                 // - C++ sender sends *with* null terminator
-                size_t strLen = header->dataLength;
+                size_t strLen = header.dataLength;
                 if (strLen > 0 && xmlData[strLen - 1] == '\0') {
                     strLen--;
                 }
@@ -372,7 +478,8 @@ void Channel::receiverLoop() {
                 processMetadata(xml);
             }
             
-            // Shift buffer
+            // Shift buffer — every accepted frame consumes >= FrameHeader::SIZE,
+            // so this loop always makes progress and cannot spin.
             if (totalFrameLen < bufferPos) {
                 memmove(recvBuffer.data(), recvBuffer.data() + totalFrameLen,
                         bufferPos - totalFrameLen);

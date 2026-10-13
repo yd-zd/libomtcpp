@@ -57,6 +57,20 @@ struct MediaFrame {
     int64_t timestamp;
 };
 
+// P0 #3 / #14 (Codex): the SINGLE production mapping from the node's captured
+// frame state to the on-wire video fields. Factored out of the worker so it is
+// unit-testable (qa-omp/review-native.cpp drives it through Sender::send and
+// independently parses the serialized VideoExtHeader) — proving the opaque vs
+// straight decision actually reaches the wire, not merely that a hand-built
+// struct round-trips the flags it set itself. The node's worker calls THIS.
+inline void applyVideoFrameMapping(MediaFrame& mf, bool opaque, bool interlaced,
+                                   int wire_colorspace) {
+    mf.codec = opaque ? Codec::BGRX : Codec::BGRA;
+    mf.flags = (opaque ? 0 : VideoFlags::Alpha) |
+               (interlaced ? VideoFlags::Interlaced : 0);
+    mf.colorSpace = wire_colorspace;
+}
+
 /**
  * Sender configuration
  */
@@ -65,6 +79,10 @@ struct SenderConfig {
     Quality quality = Quality::Default;
     int port = Constants::NETWORK_PORT_START;
     int sendBufferSize = Constants::NETWORK_SEND_BUFFER;  // Official: 65536 (64KB)
+    // P0 #19: per-channel async send pool depth. Default keeps the proven
+    // libomtnet value (NETWORK_ASYNC_COUNT=4); tunable down (less memory) or up
+    // (more in-flight sends) per instance. Clamped to [1,16] in the Channel.
+    int sendQueueSize = Constants::NETWORK_ASYNC_COUNT;
     std::string senderInfoXml = "<OMTInfo ProductName=\"OMT Android Sender\" Manufacturer=\"Open Media Transport\" Version=\"1.0\" />";
 };
 
@@ -74,6 +92,23 @@ struct SenderConfig {
  */
 class Sender : public IChannelListener {
 public:
+    // P0 #9 (Codex): expose the pure frame validator for the native regression
+    // harness (same-class access to the private static). No side effects.
+    static bool validateFrameForTest(const MediaFrame& frame) { return validateFrame(frame); }
+
+    // P0 #8 (Codex round-5/6): the FULL congestion decision — threshold + quality
+    // gate + downgrade map — exposed for the native harness to DIRECTLY observe
+    // congestion-adjustment execution (deterministic, not reliant on flaky network
+    // backpressure). checkCongestion() calls it UNDER encoderMutex_ so config_.quality
+    // and currentProfile_ are read/written under the lock.
+    static int congestionDecision(double dropRate, Quality quality, int currentProfile);
+
+    // P0 #8 (Codex round-6): drives the REAL locked congestion state-update (reads
+    // config_.quality + writes currentProfile_ + destroys the encoder under
+    // encoderMutex_) with an injected drop rate, so the harness can exercise that
+    // production path concurrently with setQuality (deterministic, not network-flaky).
+    void applyCongestionForTest(double dropRate) { applyCongestionLocked(dropRate); }
+
     /**
      * Create sender with name and quality
      */
@@ -116,6 +151,13 @@ public:
      * Get current connection count
      */
     int connectionCount() const;
+
+    /**
+     * P0 #20 (Codex): count of CONNECTED channels that have actually subscribed
+     * to the VIDEO stream — the truthful "Subscribers" figure (connectionCount
+     * counts every TCP connection, including audio/metadata-only peers).
+     */
+    int videoSubscriberCount() const;
     
     /**
      * Get aggregated statistics
@@ -129,8 +171,13 @@ public:
 
     /**
      * Get the current VMX profile ID.
+     * P0 #8 (Codex): currentProfile_ is written under encoderMutex_ (setQuality /
+     * onQualityChanged / checkCongestion), so read it under the same lock.
      */
-    int getCurrentProfile() const { return currentProfile_; }
+    int getCurrentProfile() const {
+        std::lock_guard<std::mutex> lock(encoderMutex_);
+        return currentProfile_;
+    }
     
     /**
      * Check if any client has tally
@@ -153,9 +200,16 @@ private:
     SenderConfig config_;
     
     // Network
-    int serverSocket_ = -1;
+    std::atomic<int> serverSocket_{-1};  // P0 #5: stable across accept-loop vs stop
     std::thread acceptThread_;
     std::atomic<bool> running_{false};
+    // P0 #5 (Codex): serialize start()/stop() so a concurrent stop can never
+    // close/recycle the listener fd while another lifecycle op is in flight, and
+    // so stop() can order shutdown -> join -> close deterministically.
+    std::mutex lifecycleMutex_;
+    // P0 #8 (Codex): guard the sender-info XML that the accept loop reads on the
+    // handshake (acceptLoop reads config_.senderInfoXml) against setSenderInfo().
+    std::mutex senderInfoMutex_;
     
     // Channels
     std::vector<std::unique_ptr<Channel>> channels_;
@@ -166,8 +220,9 @@ private:
     int currentWidth_ = 0;
     int currentHeight_ = 0;
     int currentProfile_ = 0;  // VMX_PROFILE stored as int
+    int currentColorSpace_ = 0;  // P0 #8: encoder cache key includes colorspace
     std::vector<uint8_t> encodeBuffer_;
-    std::mutex encoderMutex_;
+    mutable std::mutex encoderMutex_;  // P0 #8: mutable so const getters can lock it
     
     // Statistics
     std::atomic<int64_t> totalEncodedBytes_{0};
@@ -187,6 +242,12 @@ private:
     
     // Encoder management
     void createEncoder(int width, int height, int frameRate, int colorSpace);
+    // P0 #8 (Codex): encoder-select + encode + payload-copy as ONE transaction
+    // under a single encoderMutex_ hold (caller must already hold the lock).
+    // P0 #9 (Codex): reject out-of-range dimensions/stride/length before alloc/VMX.
+    static bool validateFrame(const MediaFrame& frame);
+    bool ensureEncoderLocked(int width, int height, int colorSpace);
+    int encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out);
     void destroyEncoder();
     int encodeFrame(const MediaFrame& frame);
     
@@ -195,6 +256,7 @@ private:
 
     // Congestion Control
     void checkCongestion();
+    void applyCongestionLocked(double dropRate);   // P0 #8 (Codex): the locked state-update, shared with applyCongestionForTest
     
     // IChannelListener implementation
     void onDisconnected(Channel* channel) override;

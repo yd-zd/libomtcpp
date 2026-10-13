@@ -105,7 +105,7 @@ enum class Quality {
 enum class FrameType : uint8_t {
     Metadata = 1,
     Video = 2,
-    Audio = 3
+    Audio = 4   // P0 #15: match libomtnet authority (was 3; audio unsupported anyway)
 };
 
 // Event types (for callbacks)

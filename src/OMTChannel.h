@@ -63,7 +63,8 @@ class Channel {
 public:
     Channel(int socketFd, struct sockaddr_in address, 
             int sendBufferSize = Constants::NETWORK_SEND_BUFFER,  // Official: 65536 (64KB)
-            IChannelListener* listener = nullptr);
+            IChannelListener* listener = nullptr,
+            int sendQueueCount = Constants::NETWORK_ASYNC_COUNT); // P0 #19: configurable async send pool depth
     
     ~Channel();
     
@@ -114,11 +115,24 @@ private:
     
     // Async send infrastructure
     std::unique_ptr<AsyncPool> sendPool_;
+    int sendQueueCount_ = Constants::NETWORK_ASYNC_COUNT; // P0 #19
     std::queue<AsyncBuffer*> pendingQueue_;
     std::mutex queueMutex_;
     std::condition_variable queueCV_;
     std::thread senderThread_;
     std::thread receiverThread_;
+    
+    // P0 #7 (Codex): serialize ALL socket writes (async video from senderLoop
+    // and synchronous metadata from sendMetadataSync) so partial writes of the
+    // two paths can never interleave on the single TCP byte stream.
+    // Plain std::mutex (NOT timed_mutex): the sync metadata writer bounds its
+    // acquisition with a try_lock() loop (std::mutex::try_lock is the path TSan
+    // models correctly; std::timed_mutex's timed acquisition produced spurious
+    // "unlock of an unlocked mutex" reports under TSan on this libstdc++).
+    std::mutex sendSocketMutex_;
+    // P0 #6 (Codex): read-half EOF is a state, not a 20ms poll loop. Once the
+    // peer closes its write half we stop reading but keep sending.
+    bool readEof_ = false;
     
     // Subscriptions and state
     std::atomic<Subscription> subscriptions_{Subscription::None};
