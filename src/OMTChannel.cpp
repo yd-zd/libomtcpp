@@ -6,9 +6,12 @@
 #include "OMTChannel.h"
 #include <cstring>
 #include <unistd.h>
+#include <thread>
+#include <chrono>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <string>
 
 #ifdef __ANDROID__
@@ -27,11 +30,37 @@
 
 namespace omt {
 
+namespace {
+// Poll-driven non-blocking full send. Blocking semantics WITHOUT touching the
+// shared fd flags (no fcntl(F_SETFL) anywhere): POLLOUT readiness + MSG_DONTWAIT.
+bool sendAllPoll(int fd, const uint8_t* data, size_t length,
+                 const std::atomic<bool>& alive) {
+    size_t off = 0;
+    while (off < length && alive.load()) {
+        struct pollfd pfd{fd, POLLOUT, 0};
+        const int pr = poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) continue;  // timeout — re-check alive
+        const ssize_t n = ::send(fd, data + off, length - off,
+                                 MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) { off += static_cast<size_t>(n); continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            continue;
+        return false;
+    }
+    return off == length;
+}
+} // namespace
+
 Channel::Channel(int socketFd, struct sockaddr_in address, 
                  int sendBufferSize, IChannelListener* listener)
     : socketFd_(socketFd), address_(address), listener_(listener) {
     
-    // Set non-blocking for recv
+    // Non-blocking ONCE at construction; nothing may flip these flags later
+    // (sendAllPoll/MSG_DONTWAIT carry the per-call semantics — see 2026-10-13 fix).
     int flags = fcntl(socketFd_, F_GETFL, 0);
     fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
     
@@ -154,22 +183,16 @@ bool Channel::sendMetadataSync(const char* xml) {
     header.metadataLength = static_cast<uint16_t>(totalLen);
     header.dataLength = totalLen;
     
-    // Temporarily make blocking
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
-    ssize_t s1 = send(socketFd_, &header, sizeof(header), MSG_NOSIGNAL);
-    
-    std::vector<char> buf(totalLen);
-    memcpy(buf.data(), xml, len);
-    buf[len] = 0;
-    
-    ssize_t s2 = send(socketFd_, buf.data(), totalLen, MSG_NOSIGNAL);
-    
-    // Restore non-blocking
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    
-    return (s1 > 0 && s2 == totalLen);
+    const int fd = socketFd_.load();
+    if (fd < 0) return false;
+
+    std::vector<char> frame(sizeof(FrameHeader) + static_cast<size_t>(totalLen));
+    memcpy(frame.data(), &header, sizeof(FrameHeader));
+    memcpy(frame.data() + sizeof(FrameHeader), xml, len);
+    frame[sizeof(FrameHeader) + len] = 0;
+
+    return sendAllPoll(fd, reinterpret_cast<const uint8_t*>(frame.data()),
+                       frame.size(), connected_);
 }
 
 int Channel::sendAsync(const void* headerData, size_t headerLen,
@@ -250,36 +273,12 @@ void Channel::senderLoop() {
 }
 
 bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
-    // Make blocking for this call
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
-    size_t remaining = length;
-    const uint8_t* ptr = data;
-    
-    while (remaining > 0 && connected_) {
-        ssize_t sent = send(socketFd_, ptr, remaining, MSG_NOSIGNAL);
-        
-        if (sent > 0) {
-            ptr += sent;
-            remaining -= sent;
-        } else if (sent < 0) {
-            if (errno == EINTR) continue;
-            
-            LOGE("sendAllBlocking: error %d (%s)", errno, strerror(errno));
-            connected_ = false;
-            
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-            return false;
-        } else {
-            connected_ = false;
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-            return false;
-        }
-    }
-    
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    return remaining == 0;
+    const int fd = socketFd_.load();
+    if (fd < 0) return false;
+    const bool okSend = sendAllPoll(fd, data, length, connected_);
+    if (!okSend)
+        connected_ = false;
+    return okSend;
 }
 
 void Channel::receiverLoop() {
@@ -309,7 +308,7 @@ void Channel::receiverLoop() {
         if (sel == 0) continue;
         
         ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
-                                recvBuffer.size() - bufferPos, 0);
+                                recvBuffer.size() - bufferPos, MSG_DONTWAIT);
         
         if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // Spurious readability after select (consumed by a parallel path
@@ -318,14 +317,24 @@ void Channel::receiverLoop() {
             // subscribe message (0 frames + later abort). Measured 2026-10-13.
             continue;
         }
-        if (received <= 0) {
-            if (received == 0) {
-                LOGI("receiverLoop: connection closed by peer");
-            } else {
-                LOGE("receiverLoop: recv error %d", errno);
-            }
+        if (received < 0) {
+            LOGE("receiverLoop: recv error %d", errno);
             connected_ = false;
             break;
+        }
+        if (received == 0) {
+            // Peer closed its WRITE half (pure receivers shutdown(SHUT_WR) after
+            // the subscribe XML). The read half is still valid — WE must keep
+            // sending. Treat as idle, NOT as disconnect. Full close surfaces as
+            // a later send error (sendAllPoll -> connected_=false), and socket
+            // death as recv errors. Verified against omt-recv 2026-10-13.
+            static bool halfCloseLogged = false;
+            if (!halfCloseLogged) {
+                LOGI("receiverLoop: peer write-half closed; keep streaming");
+                halfCloseLogged = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
         }
         
         bytesReceived_ += received;
