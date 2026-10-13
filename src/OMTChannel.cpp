@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
+#include <string>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -17,9 +18,11 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
-#define LOGI(...) 
-#define LOGE(...)
-#define LOGD(...)
+#include <cstdio>
+#define LOGI(...) do{std::fprintf(stderr,"[omt][I] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGE(...) do{std::fprintf(stderr,"[omt][E] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGW(...) do{std::fprintf(stderr,"[omt][W] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGD(...) do{std::fprintf(stderr,"[omt][D] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
 #endif
 
 namespace omt {
@@ -104,9 +107,9 @@ void Channel::disconnect() {
 }
 
 void Channel::closeSocket() {
-    if (socketFd_ > 0) {
-        close(socketFd_);
-        socketFd_ = -1;
+    const int fd = socketFd_.exchange(-1);
+    if (fd >= 0) {
+        close(fd);
     }
 }
 
@@ -286,13 +289,16 @@ void Channel::receiverLoop() {
     size_t bufferPos = 0;
     
     while (running_ && connected_) {
+        const int fd = socketFd_.load();
+        if (fd < 0)
+            break; // socket already closed by ~Channel/disconnect — see FD_SET guard
         fd_set readfds;
         FD_ZERO(&readfds);
-        FD_SET(socketFd_, &readfds);
+        FD_SET(fd, &readfds);
         
         struct timeval tv{0, 100000};  // 100ms
         
-        int sel = select(socketFd_ + 1, &readfds, nullptr, nullptr, &tv);
+        int sel = select(fd + 1, &readfds, nullptr, nullptr, &tv);
         
         if (sel < 0) {
             if (errno == EINTR) continue;
@@ -302,13 +308,20 @@ void Channel::receiverLoop() {
         
         if (sel == 0) continue;
         
-        ssize_t received = recv(socketFd_, recvBuffer.data() + bufferPos,
+        ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
                                 recvBuffer.size() - bufferPos, 0);
         
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Spurious readability after select (consumed by a parallel path
+            // or SO_RCVLOWAT race). NOT a disconnect — keep polling. Treating
+            // EAGAIN as peer-close killed every subscribed channel after the
+            // subscribe message (0 frames + later abort). Measured 2026-10-13.
+            continue;
+        }
         if (received <= 0) {
             if (received == 0) {
                 LOGI("receiverLoop: connection closed by peer");
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            } else {
                 LOGE("receiverLoop: recv error %d", errno);
             }
             connected_ = false;

@@ -7,6 +7,7 @@
  */
 
 #include "OMTDiscovery.h"
+#include <string>
 #include <algorithm>
 #include <chrono>
 #include <cstring>

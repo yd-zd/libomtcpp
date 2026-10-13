@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <sstream>
+#include <string>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -23,10 +24,11 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
-#define LOGI(...) 
-#define LOGE(...)
-#define LOGW(...)
-#define LOGD(...)
+#include <cstdio>
+#define LOGI(...) do{std::fprintf(stderr,"[omt][I] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGE(...) do{std::fprintf(stderr,"[omt][E] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGW(...) do{std::fprintf(stderr,"[omt][W] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
+#define LOGD(...) do{std::fprintf(stderr,"[omt][D] " __VA_ARGS__);std::fprintf(stderr,"\n");}while(0)
 #endif
 
 namespace omt {

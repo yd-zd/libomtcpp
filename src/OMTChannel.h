@@ -17,6 +17,7 @@
 #include <thread>
 #include <condition_variable>
 #include <memory>
+#include <string>
 #include <functional>
 #include <arpa/inet.h>
 
@@ -106,7 +107,7 @@ public:
 
 private:
     // Socket
-    int socketFd_;
+    std::atomic<int> socketFd_{-1};
     struct sockaddr_in address_;
     std::atomic<bool> connected_{true};
     std::atomic<bool> running_{true};
