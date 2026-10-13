@@ -158,6 +158,10 @@ public:
      * counts every TCP connection, including audio/metadata-only peers).
      */
     int videoSubscriberCount() const;
+    // Test seam: the actual listener descriptor the running sender is bound to,
+    // or -1 when not listening. Used by the native teardown cycle test to prove
+    // the old fd is closed (EBADF) before any replacement fd is opened.
+    int listenerFdForTest() const { return serverSocket_.load(); }
     
     /**
      * Get aggregated statistics
