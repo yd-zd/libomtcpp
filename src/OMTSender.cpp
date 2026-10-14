@@ -488,6 +488,17 @@ bool Sender::ensureEncoderLocked(int width, int height, int colorSpace) {
 int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out) {
     if (!vmxInstance_) return 0;
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
+    // Defense-in-depth (Codex interlace review): VMX only encodes interlaced at
+    // 480/576/1080 (VMX_ConfigureInterlaced); at any other height it silently stays
+    // PROGRESSIVE, so advertising the Interlaced wire flag would make the header lie
+    // about the payload. Fail closed HERE too — the node's height gate normally rejects
+    // this first with a user-facing status, but a direct sender.send must never emit an
+    // interlaced-flagged progressive payload (this is the path the native test exposed).
+    if (interlaced && !(frame.height == 480 || frame.height == 576 || frame.height == 1080)) {
+        LOGE("interlaced at unsupported height %d (VMX interlaces only 480/576/1080) — "
+             "refusing to advertise a lying header", frame.height);
+        return 0;
+    }
     VMX_ERR err = VMX_ERR_UNKNOWN;
     BYTE* data = static_cast<BYTE*>(frame.data);
     switch (frame.codec) {
