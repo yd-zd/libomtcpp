@@ -377,6 +377,15 @@ int Sender::encodeFrame(const MediaFrame& frame) {
     if (!vmxInstance_) return 0;
     
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
+    // Defense-in-depth (Codex interlace review): keep this legacy/alternate encode path
+    // consistent with encodeFrameLocked — never advertise the Interlaced wire flag on a
+    // height VMX encodes as progressive (480/576/1080 only). This overload is currently
+    // unreferenced by the node, but guarding it prevents a lying header if it is revived.
+    if (interlaced && !(frame.height == 480 || frame.height == 576 || frame.height == 1080)) {
+        LOGE("interlaced at unsupported height %d (VMX interlaces only 480/576/1080) — refusing",
+             frame.height);
+        return 0;
+    }
     VMX_ERR err = VMX_ERR_UNKNOWN;
     
     BYTE* data = static_cast<BYTE*>(frame.data);
