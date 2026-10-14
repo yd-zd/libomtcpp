@@ -76,6 +76,15 @@ bool Sender::start() {
         serverSocket_ = -1;
         return false;
     }
+    // P2 #8 (Codex): validate the port at the ACTUAL narrowing boundary — config_.port
+    // is an int fed to htons (uint16_t); out-of-range values wrap silently (65536->0,
+    // -1->65535) and bind the wrong port. Fail-closed, matching the bind-address guard.
+    if (config_.port < 1 || config_.port > 65535) {
+        LOGE("Sender: listen port %d out of range 1..65535 — refusing to start", config_.port);
+        close(ss);
+        serverSocket_ = -1;
+        return false;
+    }
     addr.sin_port = htons(config_.port);
     
     if (bind(ss, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
