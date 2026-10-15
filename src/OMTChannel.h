@@ -101,7 +101,12 @@ public:
     
     // Statistics
     ChannelStats getStats() const;
-    
+
+    /// Queued frames the sender threw away to make room for a NEWER one (see the
+    /// drop-oldest policy in sendAsync). A subset of framesDropped_: a frame that found
+    /// the ring full with nothing left to evict is counted in framesDropped_ only.
+    int64_t staleEvicted() const { return staleEvicted_.load(); }
+
     // Endpoint info
     std::string getRemoteAddress() const;
     int getRemotePort() const;
@@ -144,6 +149,8 @@ private:
     // Statistics
     std::atomic<int64_t> framesSent_{0};
     std::atomic<int64_t> framesDropped_{0};
+    /// Frames evicted from the queue by the drop-oldest policy (see sendAsync).
+    std::atomic<int64_t> staleEvicted_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
     

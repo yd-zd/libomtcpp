@@ -153,8 +153,9 @@ Channel::~Channel() {
     
     closeSocket(); // P0 #5: the single, final close — after both threads joined
     
-    LOGI("Channel: destroyed, sent=%lld, dropped=%lld", 
-         (long long)framesSent_.load(), (long long)framesDropped_.load());
+    LOGI("Channel: destroyed, sent=%lld, dropped=%lld, stale-evicted=%lld", 
+         (long long)framesSent_.load(), (long long)framesDropped_.load(),
+         (long long)staleEvicted_.load());
 }
 
 void Channel::disconnect() {
@@ -274,6 +275,41 @@ int Channel::sendAsync(const void* headerData, size_t headerLen,
     }
     
     AsyncBuffer* buf = sendPool_->acquire();
+    if (!buf) {
+        // Drop policy: the OLDEST waiting frame loses, the frame in hand survives.
+        //
+        // It used to be the opposite — no free buffer meant throwing away THIS frame
+        // and keeping whatever was already queued. With the 4-slot / 1 MB ring a
+        // subscriber gets (NETWORK_ASYNC_COUNT x NETWORK_ASYNC_BUFFER_AV) and a peer
+        // that stalls for a moment, the queue fills with the oldest frames, so when the
+        // window reopens senderLoop replays up to 4 already-decoded frames — 133 ms of
+        // stale video at 30 fps — before anything live reaches the screen. A momentary
+        // stall therefore arrived at the viewer as a permanent latency jump instead of
+        // as a couple of lost frames. On a live stream the newest frame is the only one
+        // worth queueing: evict the oldest WAITING buffer, hand its slot to this frame,
+        // and count the eviction.
+        //
+        // Safety notes, specific to this hardened desktop copy:
+        //  - Only buffers still in pendingQueue_ are eligible. The buffer senderLoop is
+        //    currently writing was already popped from that queue under queueMutex_, so
+        //    it can never be released here while a send is in flight on it.
+        //  - sendSocketMutex_ (P0 #7) is deliberately NOT touched: this path queues, it
+        //    never writes to the socket, so metadata/video byte-stream serialization is
+        //    unchanged.
+        //  - The eviction is a whole-frame removal, so a partial record can never be
+        //    left on the wire.
+        AsyncBuffer* stale = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!pendingQueue_.empty()) { stale = pendingQueue_.front(); pendingQueue_.pop(); }
+        }
+        if (stale) {
+            sendPool_->release(stale);
+            staleEvicted_++;
+            framesDropped_++;
+            buf = sendPool_->acquire();
+        }
+    }
     if (!buf) {
         framesDropped_++;
         static int dropLog = 0;
