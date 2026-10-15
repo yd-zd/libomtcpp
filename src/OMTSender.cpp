@@ -462,6 +462,23 @@ bool Sender::validateFrame(const MediaFrame& frame) {
         return false;                                          // unknown codec
     }
     if (static_cast<uint64_t>(frame.dataLength) < need) return false;
+    // Codex sendfeatures P1: the ext-header carries frame.colorSpace VERBATIM
+    // (OMTSender.cpp:592), while VMX's BGRA/BGRX dispatch only ever selects a 601 or
+    // 709 conversion table (vmxcodec.cpp:1432/1638 — the 2020 case is not wired for
+    // these inputs). Accepting 2020 here therefore produced a payload encoded with the
+    // 709 matrix under a header advertising BT.2020 primaries: a lie that a loopback
+    // between two copies of the same fallback hides, and that a downstream colour-managed
+    // consumer will faithfully mis-render. The established contract at this boundary is
+    // undefined(0)/601/709; anything else is refused BEFORE the encoder is touched.
+    // Native 2020 needs validated forward/inverse tables plus a qualified receiver path,
+    // not a different enum value here.
+    if (!(frame.colorSpace == ColorSpace::Unknown || frame.colorSpace == ColorSpace::BT601 ||
+          frame.colorSpace == ColorSpace::BT709)) {
+        LOGE("send: refusing colour space %d — VMX encodes 601/709 matrices only; advertising "
+             "%d on the wire over a 709-matrix payload would be a lying header",
+             frame.colorSpace, frame.colorSpace);
+        return false;
+    }
     return true;
 }
 
