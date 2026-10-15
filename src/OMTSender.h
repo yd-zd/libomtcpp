@@ -94,7 +94,14 @@ struct SenderConfig {
     // back-pressure paths are observable in a harness in seconds instead of tens of
     // seconds, and so an operator with a genuinely slow WAN viewer can widen them.
     ChannelBudgets budgets;
-    std::string senderInfoXml = "<OMTInfo ProductName=\"OMT Android Sender\" Manufacturer=\"Open Media Transport\" Version=\"1.0\" />";
+    // The desktop sender's self-report. "OMT Android Sender" here was inherited from the
+    // Android vendor tree that this copy was ported from and never corrected: OBS listed a
+    // Linux broadcast node as an Android camera. The Android app keeps its own default in its
+    // OWN tree — changing this line does not touch it. Both fields stay overridable through
+    // SenderConfig::senderInfoXml or Sender::setSenderInfo(), which is what the node calls.
+    // Proven at the wire, not by grepping this header: qa-ompin/wire-slow-reader.cpp case
+    // sender-identity connects a real peer and asserts what actually arrived.
+    std::string senderInfoXml = "<OMTInfo ProductName=\"nodos OmpOut\" Manufacturer=\"Nodos\" Version=\"1.0\" />";
 };
 
 /**
