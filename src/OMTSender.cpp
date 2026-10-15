@@ -198,9 +198,21 @@ void Sender::acceptLoop() {
         }
         
         auto channel = std::make_unique<Channel>(clientFd, clientAddr, bufferSize, this,
-                                                 config_.sendQueueSize);
+                                                 config_.sendQueueSize, config_.budgets);
         
         // Send configured sender info immediately.
+        //
+        // QUEUED, not written here. The banner used to go out through the synchronous
+        // writer on the accept thread, which had two measured consequences: (1) the
+        // accept loop sat in a 5-6 second bounded write whenever the new viewer was
+        // not draining yet, holding up every OTHER incoming connection; (2) when that
+        // write did not finish, the channel was called dead — 802 times in three
+        // minutes against OBS, because a viewer that has not read yet is exactly what
+        // a connecting viewer looks like. queueMetadata() puts the banner in the
+        // channel's single waiting slot and lets its own writer thread send it the
+        // moment the socket will take it, so the banner still reaches the peer (proved
+        // by qa-ompin/wire-slow-reader.cpp) without the accept thread ever blocking.
+        //
         // P0 #8 (Codex): snapshot config_.senderInfoXml under senderInfoMutex_ so
         // the handshake read never races setSenderInfo() on the std::string.
         std::string infoXml;
@@ -208,7 +220,7 @@ void Sender::acceptLoop() {
             std::lock_guard<std::mutex> lk(senderInfoMutex_);
             infoXml = config_.senderInfoXml;
         }
-        channel->sendMetadataSync(infoXml.c_str());
+        channel->queueMetadata(infoXml.c_str());
 
         if (onConnect_) {
             onConnect_(channel.get());

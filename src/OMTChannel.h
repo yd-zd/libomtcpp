@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <memory>
 #include <string>
+#include <vector>
 #include <functional>
 #include <arpa/inet.h>
 
@@ -29,6 +30,39 @@ namespace omt {
 
 // Forward declarations
 class Sender;
+
+/**
+ * Why a BOUNDED socket write stopped before the frame was complete.
+ *
+ * The distinction is the entire point of this type. A peer that merely stopped
+ * draining (Timeout) is alive: OBS pauses its decoder, its receive window closes
+ * for a moment, and the bytes we already committed are still going to be read. A
+ * peer that is gone (PeerGone) is not: the kernel told us so (EPIPE/ECONNRESET/
+ * ENOTCONN). The desktop sender used to treat both as death, and the measured
+ * result on the live engine was 802 channel teardowns in three minutes against a
+ * subscribed OBS — ~4.5 kills per second, with video only visible because the
+ * viewer reconnected that fast. qa-ompin/wire-slow-reader.cpp is the harness that
+ * reproduces it over a real socket and pins the difference down.
+ */
+enum class SendOutcome : uint8_t {
+    Ok       = 0,   // every byte reached the socket
+    Timeout  = 1,   // the budget expired: ALIVE, just not draining — back-pressure
+    PeerGone = 2    // a hard socket error: the connection is dead
+};
+
+/**
+ * Ceilings for one channel's socket-write pipeline. Every field is a ceiling,
+ * never a "block until it finishes": the whole class of bug this file carries is
+ * bounded waits that were mistaken for dead peers. The defaults are the shipping
+ * values; a harness may lower them to make the bounded paths observable in seconds
+ * instead of tens of seconds (qa-ompin/wire-slow-reader.cpp does).
+ */
+struct ChannelBudgets {
+    int lockBudgetMs  = 6000;  // sendMetadataSync's wait for the shared write lock
+    int sendTimeoutMs = 5000;  // how long ONE frame may take to reach the socket
+    int flushBudgetMs = 200;   // how long a half-written frame gets on an idle tick
+    int stalledPeerMs = 30000; // no byte of progress for this long -> the peer is gone
+};
 
 /**
  * Channel statistics
@@ -64,7 +98,8 @@ public:
     Channel(int socketFd, struct sockaddr_in address, 
             int sendBufferSize = Constants::NETWORK_SEND_BUFFER,  // Official: 65536 (64KB)
             IChannelListener* listener = nullptr,
-            int sendQueueCount = Constants::NETWORK_ASYNC_COUNT); // P0 #19: configurable async send pool depth
+            int sendQueueCount = Constants::NETWORK_ASYNC_COUNT,  // P0 #19: configurable async send pool depth
+            const ChannelBudgets& budgets = ChannelBudgets{});    // see ChannelBudgets
     
     ~Channel();
     
@@ -98,6 +133,34 @@ public:
                   const void* payloadData, size_t payloadLen);
     
     bool sendMetadataSync(const char* xml);
+
+    /**
+     * Queue a metadata (control) frame for the channel's own writer thread, to be
+     * written as soon as the socket will take it. Non-blocking, and the ONE thing
+     * that makes the accept-time OMTInfo banner survivable: a peer that is not
+     * draining at the moment we accept it must still receive the banner the second
+     * it starts reading, and the accept loop must not sit in a 5-second write for
+     * the sake of a viewer nobody has accepted yet.
+     *
+     * Bounded by construction: there is exactly ONE waiting slot, and a newer
+     * metadata frame replaces the unsent older one (metadata is state, not a
+     * stream — the last OMTInfo is the true one). So the queue can never grow, and
+     * metadataSuperseded() counts what a replacement cost.
+     */
+    bool queueMetadata(const char* xml);
+
+    // Observability for the harnesses (qa-ompin/wire-slow-reader.cpp). Each counter
+    // is the only way to see a property that is invisible in the received bytes:
+    //   metadataAttempts()   proves the banner was genuinely RETRIED, not merely
+    //                        written on the first try (an anti-vacuity pin).
+    //   metadataSuperseded() proves the single waiting slot stayed single while
+    //                        dozens of frames were queued behind it.
+    int64_t metadataAttempts() const { return metadataAttempts_.load(); }
+    int64_t metadataSuperseded() const { return metadataSuperseded_.load(); }
+    /// Bytes currently held in the ONE waiting metadata slot (<= one control frame).
+    int64_t queuedMetadataBytes() const;
+    /// True while a half-written frame owns the byte stream.
+    bool hasPendingWriteForTest() const;
     
     // Statistics
     ChannelStats getStats() const;
@@ -122,10 +185,55 @@ private:
     std::unique_ptr<AsyncPool> sendPool_;
     int sendQueueCount_ = Constants::NETWORK_ASYNC_COUNT; // P0 #19
     std::queue<AsyncBuffer*> pendingQueue_;
-    std::mutex queueMutex_;
+    mutable std::mutex queueMutex_;
     std::condition_variable queueCV_;
     std::thread senderThread_;
     std::thread receiverThread_;
+
+    ChannelBudgets budgets_{};                       // the ceilings, set once at construction
+
+    // ------------------------------------------------------------------ the socket-write pipeline
+    //
+    // ONE half-written frame, owned by whoever holds sendSocketMutex_. This exists
+    // because "do not tear the channel down on a slow peer" is only safe if the
+    // bytes already committed to the stream are finished before ANY other byte is
+    // written: a metadata frame cut in half and abandoned desynchronizes the peer's
+    // framer for the rest of the connection, which is exactly why the original code
+    // reached for connected_=false. Keeping the remainder here turns the same event
+    // into back-pressure — the next writer completes it first, then carries on.
+    // Touched ONLY while sendSocketMutex_ is held (never under queueMutex_).
+    std::vector<uint8_t> continuation_;
+    size_t continuationOffset_ = 0;
+    bool continuationActive_ = false;
+    bool continuationIsVideo_ = false;
+    // Wake-up hint for senderLoop, so it keeps nursing the half-written frame even
+    // on an otherwise idle tick. Written by any writer, read by the CV predicate;
+    // the authoritative state is continuationActive_ above, under the write lock.
+    std::atomic<bool> continuationPending_{false};
+
+    // The ONE metadata frame waiting for the socket (see queueMetadata). Under
+    // queueMutex_, single-slot, newest wins — it cannot grow.
+    std::vector<uint8_t> pendingMetadata_;
+    bool pendingMetadataActive_ = false;
+
+    // Liveness, as opposed to back-pressure: the last moment any byte of ours
+    // actually reached the socket. If a channel has work to send and has made no
+    // progress at all for budgets_.stalledPeerMs, the peer is not merely slow any
+    // more and the channel is reaped — otherwise "slow is not dead" would quietly
+    // mean "a viewer that freezes never leaves", and TCP keepalive (5s idle, but
+    // 75s x 9 probes before it errors anything) is far too slow to be the bound.
+    std::atomic<int64_t> progressUs_{0};
+
+    // Log-once-per-storm, per kind: 0 = video write, 1 = metadata write,
+    // 2 = socket-write-lock budget, 3 = stalled-peer reap. The live failure was
+    // 802 identical warning lines in three minutes; a warning that repeats once
+    // per retry is not a diagnostic, it is the outage. Each flag clears again when
+    // a write fully succeeds, so a NEW stall is still reported.
+    std::atomic<bool> warnedWrite_[4] = { {false}, {false}, {false}, {false} };
+
+    std::atomic<int64_t> metadataAttempts_{0};
+    std::atomic<int64_t> metadataSuperseded_{0};
+
     
     // P0 #7 (Codex): serialize ALL socket writes (async video from senderLoop
     // and synchronous metadata from sendMetadataSync) so partial writes of the
@@ -134,7 +242,8 @@ private:
     // acquisition with a try_lock() loop (std::mutex::try_lock is the path TSan
     // models correctly; std::timed_mutex's timed acquisition produced spurious
     // "unlock of an unlocked mutex" reports under TSan on this libstdc++).
-    std::mutex sendSocketMutex_;
+    // mutable: hasPendingWriteForTest() peeks under it from a const method.
+    mutable std::mutex sendSocketMutex_;
     // P0 #6 (Codex): read-half EOF is a state, not a 20ms poll loop. Once the
     // peer closes its write half we stop reading but keep sending.
     bool readEof_ = false;
@@ -161,8 +270,27 @@ private:
     void senderLoop();
     void receiverLoop();
     
-    // Internal send
-    bool sendAllBlocking(const uint8_t* data, size_t length);
+    // Internal send: the async video writer and the sync metadata writer share ONE
+    // critical section (sendSocketMutex_) and one continuation slot, so a partial
+    // write of either is always finished before any other byte goes on the stream.
+    // (The old `sendAllBlocking` helper is gone: it called the same poll loop and
+    // then called the channel dead for any reason at all, which was the bug.)
+
+    // ------------------------------------------------------------------ socket-write pipeline helpers
+    // Every one of these is called ONLY while sendSocketMutex_ is held.
+    SendOutcome flushContinuationLocked(int fd, int timeoutMs);
+    SendOutcome startFrameLocked(int fd, const uint8_t* data, size_t length,
+                                 bool isVideo, int timeoutMs);
+    void clearContinuationLocked();
+    // Install `frame` into the single waiting-metadata slot (newest wins). Takes
+    // queueMutex_ itself, so callers must hold NO lock.
+    void holdMetadataForRetry(std::vector<uint8_t> frame);
+    // One warning per stall episode per `kind` (see warnedWrite_), not per attempt.
+    void warnOnce(int kind, const char* fmt, ...);
+    void noteProgress() {
+        progressUs_.store(SteadyUs(), std::memory_order_relaxed);
+    }
+    static int64_t SteadyUs();
     
     // Metadata processing (port of ProcessMetadata)
     void processMetadata(const std::string& xml);

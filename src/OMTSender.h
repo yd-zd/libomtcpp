@@ -89,6 +89,11 @@ struct SenderConfig {
     // libomtnet value (NETWORK_ASYNC_COUNT=4); tunable down (less memory) or up
     // (more in-flight sends) per instance. Clamped to [1,16] in the Channel.
     int sendQueueSize = Constants::NETWORK_ASYNC_COUNT;
+    // The per-channel socket-write ceilings (see ChannelBudgets). Defaults are the
+    // shipping values; they are configuration rather than constants so the bounded
+    // back-pressure paths are observable in a harness in seconds instead of tens of
+    // seconds, and so an operator with a genuinely slow WAN viewer can widen them.
+    ChannelBudgets budgets;
     std::string senderInfoXml = "<OMTInfo ProductName=\"OMT Android Sender\" Manufacturer=\"Open Media Transport\" Version=\"1.0\" />";
 };
 
