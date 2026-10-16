@@ -67,11 +67,26 @@ struct ChannelBudgets {
 /**
  * Channel statistics
  */
+// Frame accounting is a PARTITION, not a set of independent tallies: every frame
+// handed to sendAsync increments framesOffered exactly once, and exactly one of the
+// three terminal counters when the frame's life ends:
+//   framesSent    - the whole record reached the socket;
+//   framesDropped - it never began a write (ring full, oversized, channel already
+//                   gone, or still queued when the channel was torn down);
+//   framesTorn    - a write BEGAN and failed partway (peer died mid-frame / the
+//                   sendAllPoll deadline expired). Half the record is on the wire and
+//                   the channel is dead.
+// Therefore, at quiescence (nothing left in the queue and no write in flight):
+//   framesOffered == framesSent + framesDropped + framesTorn
+// At any instant the stronger form holds with pendingDepth() added — see the
+// `torn-write` case in qa-omp/review-native.cpp, which checks both.
 struct ChannelStats {
     int64_t framesSent = 0;
     int64_t framesDropped = 0;
     int64_t bytesSent = 0;
     int64_t bytesReceived = 0;
+    int64_t framesOffered = 0;
+    int64_t framesTorn = 0;
 };
 
 /**
@@ -170,6 +185,27 @@ public:
     /// the ring full with nothing left to evict is counted in framesDropped_ only.
     int64_t staleEvicted() const { return staleEvicted_.load(); }
 
+    /// Frames still waiting in pendingQueue_ — neither sent nor dropped yet. The
+    /// reconciliation identity is offered == sent + dropped + torn + pendingDepth().
+    int64_t pendingDepth() const;
+
+    /// Throw away everything still queued, counting each frame as dropped. ~Channel
+    /// calls this once both threads have joined (so a frame cannot be counted twice);
+    /// it is public because the reconciliation must be observable BEFORE teardown —
+    /// after ~Channel the counters are gone with the channel.
+    int64_t discardPending();
+
+    /// Drops since the previous call to this method (0 when nobody reported them).
+    /// This is the counter omt_send_get_recent_drops_and_reset() exposes: a UI that
+    /// polls it shows "drops in the last poll interval", not a lifetime total it has
+    /// to difference itself. Consumes the window (exchange, not read), so a caller
+    /// that reads it twice in a row sees the drops once and then 0.
+    ///
+    /// A channel that dies with an un-read window does NOT lose those drops:
+    /// Sender::removeChannel() folds takeRecentDrops() into its own accumulator before
+    /// destroying the channel, so the window survives the teardown.
+    int64_t takeRecentDrops() { return recentDrops_.exchange(0); }
+
     // Endpoint info
     std::string getRemoteAddress() const;
     int getRemotePort() const;
@@ -185,7 +221,7 @@ private:
     std::unique_ptr<AsyncPool> sendPool_;
     int sendQueueCount_ = Constants::NETWORK_ASYNC_COUNT; // P0 #19
     std::queue<AsyncBuffer*> pendingQueue_;
-    mutable std::mutex queueMutex_;
+    mutable std::mutex queueMutex_;   // const-pendingDepth() reads the queue under it
     std::condition_variable queueCV_;
     std::thread senderThread_;
     std::thread receiverThread_;
@@ -258,10 +294,38 @@ private:
     // Statistics
     std::atomic<int64_t> framesSent_{0};
     std::atomic<int64_t> framesDropped_{0};
+    /// Every frame handed to sendAsync, counted at the door before any early return.
+    /// The reconciliation invariant (see ChannelStats) is
+    /// framesOffered == framesSent + framesDropped + framesTorn + pendingQueue depth,
+    /// so a frame can neither vanish from the statistics nor be counted twice.
+    std::atomic<int64_t> framesOffered_{0};
+    /// Dequeued frames whose write began and failed partway (peer died / deadline).
+    /// Disjoint from framesDropped_: a torn frame got on the wire, a dropped one never did.
+    std::atomic<int64_t> framesTorn_{0};
     /// Frames evicted from the queue by the drop-oldest policy (see sendAsync).
     std::atomic<int64_t> staleEvicted_{0};
+    /// Drops since someone last asked (see takeRecentDrops) — the window the
+    /// congestion alert in a UI reads. Incremented ONLY inside countDropped(), so it
+    /// cannot drift from framesDropped_ the way a second tally at each call site would.
+    std::atomic<int64_t> recentDrops_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
+
+    /// The ONE place a frame is counted as dropped, so no early-return path in
+    /// sendAsync can forget the tally and the drop counters cannot drift apart.
+    /// Both the lifetime counter and the recent-drop window move HERE, never at a
+    /// call site — a drop that is invisible to recentDrops_ is a congestion alert
+    /// that never fires (the exact Android defect this port closes on desktop).
+    void countDropped() { framesDropped_++; recentDrops_++; }
+
+    /// The ONE place a torn write is counted (see countDropped for the same
+    /// single-site discipline): a frame whose write BEGAN and will never complete
+    /// (peer died under it, the bounded write expired, or the loop is ending
+    /// around a retained continuation). Only video frames join the
+    /// offered/sent/dropped/torn partition, so both guards are explicit at the
+    /// call sites — senderLoop's PeerGone, the death of a retained continuation,
+    /// and the loop-exit sweep. Disjoint from countDropped by construction.
+    void countTorn(bool beganWrite, bool isVideo);
     
     // Listener
     IChannelListener* listener_;

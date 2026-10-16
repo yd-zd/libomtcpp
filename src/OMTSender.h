@@ -37,6 +37,14 @@ struct SenderStats {
     int64_t totalBytesSent = 0;
     int64_t totalEncodedBytes = 0;
     int connectionCount = 0;
+    // Aggregated per-channel frame partition (see ChannelStats): every frame handed to
+    // a channel is offered once and lands in exactly one terminal counter, so
+    //   totalFramesOffered == sent + dropped + torn   (at quiescence)
+    // is checkable from the outside. totalStaleEvicted is the subset of the drops the
+    // drop-oldest policy itself caused.
+    int64_t totalFramesOffered = 0;
+    int64_t totalFramesTorn = 0;
+    int64_t totalStaleEvicted = 0;
 };
 
 /**
@@ -185,6 +193,20 @@ public:
      * Get aggregated statistics
      */
     SenderStats getStats();
+
+    /**
+     * Drops since the PREVIOUS call to this method, across every channel (0 when
+     * nothing has dropped since you last asked). This is what
+     * omt_send_get_recent_drops_and_reset() exposes; before it existed that entry
+     * point was a stub returning 0, which made a consumer's congestion alert
+     * permanently unreachable (the Android defect, still open on desktop).
+     *
+     * Reading it CONSUMES the window: each channel's counter is exchanged to 0, and
+     * drops carried by channels that were destroyed since the last call are folded in
+     * from the sender's own accumulator, so a window is never lost by a teardown and
+     * never reported twice.
+     */
+    int64_t recentDropsAndReset();
     
     /**
      * Get the best suggested quality from all clients
@@ -249,6 +271,9 @@ private:
     // Statistics
     std::atomic<int64_t> totalEncodedBytes_{0};
     std::atomic<int> frameCount_{0};
+    /// Un-read recent-drop windows of channels that were destroyed since the last
+    /// recentDropsAndReset() (see the banking in removeChannel/cleanupDisconnected).
+    std::atomic<int64_t> retiredRecentDrops_{0};
     
     // Callbacks
     ConnectionCallback onConnect_;

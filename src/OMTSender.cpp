@@ -246,7 +246,12 @@ void Sender::removeChannel(Channel* channel) {
         std::lock_guard<std::mutex> lock(channelsMutex_);
         for (auto it = channels_.begin(); it != channels_.end(); ++it) {
             if (it->get() == channel) {
+                // Bank its un-read window BEFORE it dies — and drain the queue first,
+                // because ~Channel's own discardPending() counts those frames as drops
+                // and by then there is no channel left to bank them from.
                 retiring = std::move(*it);
+                retiring->discardPending();     // counts its own drops into the window
+                retiredRecentDrops_ += retiring->takeRecentDrops();
                 channels_.erase(it);
                 break;
             }
@@ -261,8 +266,14 @@ void Sender::cleanupDisconnected() {
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
         for (auto it = channels_.begin(); it != channels_.end(); ) {
-            const Channel* c = it->get();
+            Channel* c = it->get();
             if (c && !c->isConnected()) {
+                // Same banking as removeChannel(): the window outlives the channel,
+                // including the frames ~Channel is about to throw away below. The drain
+                // bumps the channel's own counter, so it must run BEFORE the take —
+                // adding its return value as well would report those frames twice.
+                c->discardPending();
+                retiredRecentDrops_ += c->takeRecentDrops();
                 retiring.push_back(std::move(*it));
                 it = channels_.erase(it);
             } else {
@@ -302,9 +313,24 @@ SenderStats Sender::getStats() {
         stats.totalFramesSent += chStats.framesSent;
         stats.totalFramesDropped += chStats.framesDropped;
         stats.totalBytesSent += chStats.bytesSent;
+        stats.totalFramesOffered += chStats.framesOffered;
+        stats.totalFramesTorn += chStats.framesTorn;
+        stats.totalStaleEvicted += ch->staleEvicted();
     }
     
     return stats;
+}
+
+int64_t Sender::recentDropsAndReset() {
+    // Take the retired windows FIRST, then the live channels'. A channel retired in
+    // between lands in the NEXT call's window rather than being double-counted here —
+    // the hand-off is an exchange on each channel's own counter, so a window can be
+    // read by exactly one caller either way.
+    int64_t n = retiredRecentDrops_.exchange(0);
+    std::lock_guard<std::mutex> lock(channelsMutex_);
+    for (const auto& ch : channels_)
+        n += ch->takeRecentDrops();
+    return n;
 }
 
 int Sender::selectProfile(Quality quality) const {

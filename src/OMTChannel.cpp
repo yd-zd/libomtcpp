@@ -216,18 +216,20 @@ Channel::~Channel() {
         senderThread_.join();
     }
     
-    // Clear pending queue
+    // Anything still queued never reached the wire. Count it (the same production
+    // path the harness drives directly before teardown) — senderLoop has been joined,
+    // so no frame can be counted here AND by the send path.
+    const int64_t discarded = discardPending();
+
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        while (!pendingQueue_.empty()) {
-            sendPool_->release(pendingQueue_.front());
-            pendingQueue_.pop();
-        }
         std::vector<uint8_t>().swap(pendingMetadata_);
         pendingMetadataActive_ = false;
     }
     // The half-written frame dies with the socket, so it needs no drain — but it
-    // must not outlive the channel either (it can hold a whole megabyte).
+    // must not outlive the channel either (it can hold a whole megabyte). The
+    // senderLoop exit already counted any retained video continuation as torn,
+    // so this is the release, never a second counter.
     {
         std::lock_guard<std::mutex> wlock(sendSocketMutex_);
         clearContinuationLocked();
@@ -235,9 +237,11 @@ Channel::~Channel() {
     
     closeSocket(); // P0 #5: the single, final close — after both threads joined
     
-    LOGI("Channel: destroyed, sent=%lld, dropped=%lld, stale-evicted=%lld", 
-         (long long)framesSent_.load(), (long long)framesDropped_.load(),
-         (long long)staleEvicted_.load());
+    LOGI("Channel: destroyed, offered=%lld, sent=%lld, dropped=%lld, torn=%lld, "
+         "stale-evicted=%lld, discarded-at-teardown=%lld",
+         (long long)framesOffered_.load(), (long long)framesSent_.load(),
+         (long long)framesDropped_.load(), (long long)framesTorn_.load(),
+         (long long)staleEvicted_.load(), (long long)discarded);
 }
 
 void Channel::disconnect() {
@@ -284,7 +288,9 @@ ChannelStats Channel::getStats() const {
         framesSent_.load(),
         framesDropped_.load(),
         bytesSent_.load(),
-        bytesReceived_.load()
+        bytesReceived_.load(),
+        framesOffered_.load(),
+        framesTorn_.load()
     };
 }
 
@@ -381,6 +387,9 @@ SendOutcome Channel::flushContinuationLocked(int fd, int timeoutMs) {
              continuationIsVideo_ ? "video" : "metadata",
              continuationOffset_, continuation_.size());
         connected_ = false;   // under the write lock — see the P0 #7 note in sendMetadataSync
+        // The half-written frame had BEGUN its write and will never finish it: torn,
+        // counted once here (metadata continuations are not in the video partition).
+        countTorn(true, continuationIsVideo_);
         clearContinuationLocked();
         return SendOutcome::PeerGone;
     }
@@ -428,6 +437,43 @@ SendOutcome Channel::startFrameLocked(int fd, const uint8_t* data, size_t length
              isVideo ? "video" : "metadata", timeoutMs);
     queueCV_.notify_one();
     return SendOutcome::Timeout;
+}
+
+int64_t Channel::pendingDepth() const {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    return static_cast<int64_t>(pendingQueue_.size());
+}
+
+int64_t Channel::discardPending() {
+    // Detach under the queue lock, then release the slots (pool mutex) outside it —
+    // same lock order as the eviction path in sendAsync, so no inversion.
+    std::vector<AsyncBuffer*> stale;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!pendingQueue_.empty()) {
+            stale.push_back(pendingQueue_.front());
+            pendingQueue_.pop();
+        }
+    }
+    for (AsyncBuffer* b : stale) {
+        sendPool_->release(b);
+        countDropped();   // queued, never written: a drop, counted exactly once
+    }
+    return static_cast<int64_t>(stale.size());
+}
+
+// The ONE place a torn write is counted — the same single-site discipline as
+// countDropped(): a frame whose write BEGAN and will never complete (the peer died
+// under it, the bounded write expired on a stalled peer, or the loop is ending
+// around a retained continuation) lands in framesTorn_ exactly once. A torn frame
+// DID get on the wire, a dropped one never did — the buckets are disjoint by
+// construction, which is what the torn-write conservation pin measures.
+void Channel::countTorn(bool beganWrite, bool isVideo) {
+    if (beganWrite) {
+        if (isVideo) {
+            framesTorn_++;
+        }
+    }
 }
 
 bool Channel::sendMetadataSync(const char* xml) {
@@ -508,12 +554,24 @@ bool Channel::sendMetadataSync(const char* xml) {
 int Channel::sendAsync(const void* headerData, size_t headerLen,
                        const void* extHeaderData, size_t extHeaderLen,
                        const void* payloadData, size_t payloadLen) {
-    if (!connected_) return 0;
+    // Every frame handed to the channel is counted at the door, BEFORE any early
+    // return, and reaches exactly one terminal counter later (sent / dropped / torn,
+    // or still queued — see the ChannelStats reconciliation). Without this the
+    // frames that died below simply vanished from the statistics.
+    framesOffered_++;
+
+    if (!connected_) {
+        // The peer is already gone: this frame never began a write, so it is a drop,
+        // not a mystery. (Before this line existed, every frame pushed after a
+        // disconnect was counted by nobody.)
+        countDropped();
+        return 0;
+    }
     
     size_t totalLen = headerLen + extHeaderLen + payloadLen;
     
     if (totalLen > static_cast<size_t>(Constants::VIDEO_MAX_SIZE)) {
-        framesDropped_++;
+        countDropped();
         LOGE("sendAsync: frame too large %zu", totalLen);
         return 0;
     }
@@ -550,12 +608,12 @@ int Channel::sendAsync(const void* headerData, size_t headerLen,
         if (stale) {
             sendPool_->release(stale);
             staleEvicted_++;
-            framesDropped_++;
+            countDropped();      // the evicted frame: terminal, counted here, once
             buf = sendPool_->acquire();
         }
     }
     if (!buf) {
-        framesDropped_++;
+        countDropped();
         static int dropLog = 0;
         if (dropLog++ % 30 == 0) {
             LOGD("sendAsync: pool exhausted (dropped: %lld)", 
@@ -640,7 +698,9 @@ void Channel::senderLoop() {
         }
 
         if (stalledOut) {
-            if (buf) sendPool_->release(buf);
+            // Popped, never began a write: a drop, counted exactly once (the
+            // partition law — see Channel::countDropped).
+            if (buf) { sendPool_->release(buf); countDropped(); }
             warnOnce(3, "no byte of ours reached the socket for %d ms while %s was queued; "
                        "treating the peer as gone",
                      budgets_.stalledPeerMs, haveMeta ? "metadata" : "video");
@@ -668,11 +728,15 @@ void Channel::senderLoop() {
                     const std::int64_t len = static_cast<std::int64_t>(buf->length);
                     outcome = startFrameLocked(fd, buf->data.data(), buf->length, /*isVideo=*/true,
                                                budgets_.sendTimeoutMs);
-                    // A TIMEOUT means the frame is RETAINED as the continuation: it is counted
-                    // when it completes, never twice. Only a frame that is genuinely gone — the
-                    // connection died under it — is a drop here.
+                    // A TIMEOUT means the frame is RETAINED as the continuation: it is
+                    // counted when it completes (flushContinuationLocked), never twice —
+                    // so it claims bufWritten here WITHOUT a counter, or the release
+                    // below would file it as a drop it is not. A frame the connection
+                    // died under had BEGUN its write: that is the torn bucket, disjoint
+                    // from dropped (test-line accounting, on wt3's pipeline).
                     if (outcome == SendOutcome::Ok) { framesSent_++; bytesSent_ += len; bufWritten = true; }
-                    else if (outcome == SendOutcome::PeerGone) { framesDropped_++; bufWritten = true; }
+                    else if (outcome == SendOutcome::PeerGone) { countTorn(true, true); bufWritten = true; }
+                    else { bufWritten = true; }   // Timeout: retained, counted on completion/death
                 } else if (outcome == SendOutcome::Ok && haveMeta) {
                     ++metadataAttempts_;
                     outcome = startFrameLocked(fd, meta.data(), meta.size(), /*isVideo=*/false,
@@ -691,7 +755,7 @@ void Channel::senderLoop() {
         // Every acquired buffer is released exactly once, on every path — a buffer stranded
         // here would shrink the ring permanently and eventually stop the channel sending.
         if (buf) {
-            if (bufLost) framesDropped_++;
+            if (bufLost) countDropped();
             sendPool_->release(buf);
         }
         // Re-queue OUTSIDE the write lock: holdMetadataForRetry takes queueMutex_, and
@@ -700,6 +764,19 @@ void Channel::senderLoop() {
         if (!keepWriting) break;
     }
     
+    // The loop is over. A video frame still retained as the continuation began its
+    // write and will never complete it — the stalled-out and socket-gone breaks leave
+    // here with the continuation LIVE, and no PeerGone counter ever ran for it. This
+    // is the single exit for an abandoned write: count it torn once, then release it
+    // (~Channel's own clear below then finds nothing and cannot double-count).
+    {
+        std::lock_guard<std::mutex> wlock(sendSocketMutex_);
+        if (continuationActive_) {
+            countTorn(true, continuationIsVideo_);
+            clearContinuationLocked();
+        }
+    }
+
     LOGI("senderLoop: exiting");
 }
 
