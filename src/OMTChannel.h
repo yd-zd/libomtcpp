@@ -20,7 +20,13 @@
 #include <string>
 #include <vector>
 #include <functional>
-#include <arpa/inet.h>
+#ifdef _WIN32
+  #define OMT_OS_WIN_TYPES 1
+  #include "omt_os_win.h"
+  #undef OMT_OS_WIN_TYPES
+#else
+  #include <arpa/inet.h>
+#endif
 
 #include "OMTConstants.h"
 #include "OMTProtocol.h"

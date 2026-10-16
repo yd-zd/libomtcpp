@@ -9,10 +9,14 @@
 
 #include <cstring>
 #include <algorithm>
+#ifdef _WIN32
+  #include "omt_os_win.h"   // full shim: this TU makes the socket calls
+#else
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#endif
 #include <sstream>
 #include <string>
 #include <limits>

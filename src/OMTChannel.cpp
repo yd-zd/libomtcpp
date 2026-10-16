@@ -7,13 +7,17 @@
 #include <cstdarg>
 #include <cstring>
 #include <cerrno>
+#ifdef _WIN32
+  #include "omt_os_win.h"   // full shim: this TU makes the socket calls
+#else
 #include <unistd.h>
-#include <thread>
-#include <chrono>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
 #include <poll.h>
+#endif
+#include <thread>
+#include <chrono>
 #include <string>
 
 #ifdef __ANDROID__
