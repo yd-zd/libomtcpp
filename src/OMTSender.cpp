@@ -135,8 +135,19 @@ void Sender::stop() {
     // which another thread's socket()/accept() could recycle, so the accept
     // thread would then accept() on a descriptor it no longer owns. Order is
     // shutdown -> join -> close (the channel's shutdown/join/close is the model).
+#ifdef _WIN32
+    // Windows: shutdown() is defined only for connected sockets and does NOT wake
+    // a pending accept() — the Linux idiom would hang the join() below until some
+    // client connects. closesocket() cancels the blocked accept (it returns
+    // WSAENOTCONN/WSAEINVAL), and acceptLoop then falls out through its
+    // running_ checks. Handled via exchange so the join-time close below is a
+    // no-op and the fd is closed exactly once.
+    const int waking = serverSocket_.exchange(-1);
+    if (waking >= 0) ::close(waking);   // full shim maps close -> closesocket
+#else
     const int lfd = serverSocket_.load();
     if (lfd >= 0) ::shutdown(lfd, SHUT_RDWR);
+#endif
 
     if (acceptThread_.joinable()) {
         acceptThread_.join();

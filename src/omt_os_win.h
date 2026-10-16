@@ -27,6 +27,11 @@
   #else
   #include <sys/types.h>   // mingw ships ssize_t
   #endif
+  // Pin the CRT errno.h parse HERE (first, before we redefine errno): UCRT's errno.h
+  // unconditionally does `#define errno (*_errno())`, so if any later <cerrno> were the
+  // TU's first parse it would win over our macro below (C4005 + wrong body). With the
+  // guard already set, every later <cerrno> include is a no-op and our mapping sticks.
+  #include <cerrno>
 
   #if !defined(OMT_OS_WIN_TYPES) && !defined(OMT_OS_WIN_FULL_DONE)
   // ---- macro surface: ONLY from .cpp translation units, never from headers ----
@@ -34,19 +39,49 @@
   // the vendor only ever reads errno AFTER a socket call, so errno IS the WSA code here.
   #undef errno
   #define errno (WSAGetLastError())
+  // Every name below already exists as a UCRT errno.h macro: #undef first (C4005),
+  // then map to the WSA code the vendor's post-call errno reads actually see.
+  #undef EINTR
   #define EINTR WSAEINTR
+  #undef EAGAIN
   #define EAGAIN WSAEWOULDBLOCK
+  #undef EWOULDBLOCK
   #define EWOULDBLOCK WSAEWOULDBLOCK
+  // A non-blocking connect on Windows reports WSAEWOULDBLOCK, never WSAEINPROGRESS —
+  // this is the standard mapping (the transport's `errno == EINPROGRESS` after
+  // connect() must match it, or every Windows Connect() falls to CONNECT_FAILED).
+  #undef EINPROGRESS
+  #define EINPROGRESS WSAEWOULDBLOCK
+  #undef ECONNREFUSED
+  #define ECONNREFUSED WSAECONNREFUSED
+  #undef EBADF
+  #define EBADF WSAEBADF
+  #undef ECONNRESET
   #define ECONNRESET WSAECONNRESET
+  #undef ECONNABORTED
   #define ECONNABORTED WSAECONNABORTED
   #define EPIPE 9991   // no WSA_EPIPE; unique so vendor's error switch keeps distinct cases
+  #undef ETIMEDOUT
   #define ETIMEDOUT WSAETIMEDOUT
+  #undef ENOTCONN
   #define ENOTCONN WSAENOTCONN
+  #undef ESHUTDOWN
   #define ESHUTDOWN WSAESHUTDOWN
+  #undef EINVAL
   #define EINVAL WSAEINVAL
+  #undef EMFILE
   #define EMFILE WSAEMFILE
+  #undef ENOBUFS
   #define ENOBUFS WSAENOBUFS
-  #define ENOMEM WSAENOBUFS
+  // ENOMEM must stay DISTINCT from ENOBUFS (a shared value would collapse switch cases).
+  #undef ENOMEM
+  #define ENOMEM 9992   // no WSA_ENOMEM; unique sentinel, same trick as EPIPE
+  #undef EHOSTUNREACH
+  #define EHOSTUNREACH WSAEHOSTUNREACH
+  #undef ENETUNREACH
+  #define ENETUNREACH WSAENETUNREACH
+  #undef ENETDOWN
+  #define ENETDOWN WSAENETDOWN
   #define SHUT_RD SD_RECEIVE
   #define SHUT_WR SD_SEND
   #define SHUT_RDWR SD_BOTH
@@ -69,20 +104,24 @@
   }
   // the Windows SDK already ships pollfd/POLLIN/POLLOUT (winsock2.h); only poll()
   // itself is missing (winsock calls it WSAPoll), so we provide just the function.
+  // select()-based: FD_SETSIZE is 64 on Windows and the except set is folded into
+  // POLLERR|POLLHUP (a failed non-blocking connect signals via except only). Every
+  // vendor call site polls exactly ONE fd — keep it that way if this is ever reused.
   inline int poll(struct pollfd* fds, unsigned n, int ms) {
-      fd_set r, w; FD_ZERO(&r); FD_ZERO(&w);
+      fd_set r, w, e; FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
       for (unsigned i = 0; i < n; ++i) {
           SOCKET s = (SOCKET)(unsigned)fds[i].fd;
           if (fds[i].events & POLLIN)  FD_SET(s, &r);
           if (fds[i].events & POLLOUT) FD_SET(s, &w);
       }
       timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-      int rc = ::select(0, &r, &w, nullptr, ms < 0 ? nullptr : &tv);
+      int rc = ::select(0, &r, &w, &e, ms < 0 ? nullptr : &tv);
       for (unsigned i = 0; i < n; ++i) {
           SOCKET s = (SOCKET)(unsigned)fds[i].fd;
           short rv = 0;
           if (FD_ISSET(s, &r)) rv |= POLLIN;
           if (FD_ISSET(s, &w)) rv |= POLLOUT;
+          if (FD_ISSET(s, &e)) rv |= POLLERR | POLLHUP;
           fds[i].revents = rv;
       }
       return rc;
