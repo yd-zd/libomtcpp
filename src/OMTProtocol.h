@@ -66,24 +66,31 @@ namespace Codec {
     constexpr int32_t YUY2 = 0x32595559;  // "YUY2"
     constexpr int32_t NV12 = 0x3231564E;  // "NV12"
     constexpr int32_t BGRA = 0x41524742;  // "BGRA"
+    constexpr int32_t BGRX = 0x58524742;  // "BGRX" (opaque/BGRX encode dispatch key)
     constexpr int32_t PCM_F32 = 0x32334650; // "FP32" (floating point audio)
 }
 
-// Video flags
+// Video flags — values MUST match the libomtnet authority
+// (omt-src/libomtnet/src/OMTPublicTypes.cs OMTVideoFlags):
+//   Interlaced=1, Alpha=2, PreMultiplied=4, Preview=8, HighBitDepth=16.
+// (HighBitDepth was wrongly 4 and PreMultiplied was missing.)
 namespace VideoFlags {
     constexpr int32_t None = 0;
     constexpr int32_t Interlaced = 1;
     constexpr int32_t Alpha = 2;
-    constexpr int32_t HighBitDepth = 4;
+    constexpr int32_t PreMultiplied = 4;
     constexpr int32_t Preview = 8;
+    constexpr int32_t HighBitDepth = 16;
 }
 
-// Color space
+// Color space — the wire value the node actually sends is VMX_COLORSPACE_BT709
+// (709) from vmxcodec.h; this enum mirrors the authority's 601/709/2020 and is
+// NOT used to set the wire colorspace (kept for reference only).
 namespace ColorSpace {
     constexpr int32_t Unknown = 0;
-    constexpr int32_t BT601 = 1;
-    constexpr int32_t BT709 = 2;
-    constexpr int32_t BT2020 = 3;
+    constexpr int32_t BT601 = 601;
+    constexpr int32_t BT709 = 709;
+    constexpr int32_t BT2020 = 2020;
 }
 
 } // namespace omt

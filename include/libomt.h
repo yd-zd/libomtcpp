@@ -536,6 +536,19 @@ extern "C" {
     void omt_send_getaudiostatistics(omt_send_t* instance, OMTStatistics* stats);
 
     /**
+    * Frames dropped (never written to the wire) SINCE THE PREVIOUS CALL to this
+    * function, summed over every connected channel plus any channel that was torn
+    * down since that call. Reading it resets the window, so a poller that calls it
+    * again with no further loss receives 0.
+    *
+    * This is the counter a congestion warning is built on: omt_send_getvideostatistics'
+    * FramesDropped is a lifetime total and cannot answer "is it dropping NOW".
+    *
+    * Returns 0 for a null instance or when nothing has dropped since the last call.
+    */
+    int64_t omt_send_get_recent_drops_and_reset(omt_send_t* instance);
+
+    /**
     * =================================================
     * Logging
     * =================================================

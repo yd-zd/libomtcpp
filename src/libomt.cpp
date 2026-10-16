@@ -307,9 +307,20 @@ void omt_send_set_quality(omt_send_t* instance, OMTQuality quality) {
 }
 
 int64_t omt_send_get_recent_drops_and_reset(omt_send_t* instance) {
-    // Not implemented in new modular design - would need to track in Sender
-    // For now, return 0 (no recent drops tracked)
-    return 0;
+    // Was a stub returning 0 ("would need to track in Sender"). A consumer that polls
+    // this to raise a congestion alert therefore NEVER raised one — the same defect
+    // that made the alert permanently unreachable on the Android build. It is now
+    // wired to the real per-channel drop windows: Sender::recentDropsAndReset()
+    // exchanges each channel's recentDrops_ counter (bumped ONLY inside
+    // Channel::countDropped(), so it cannot drift from framesDropped_) and folds in
+    // the windows of channels that were destroyed since the last call.
+    //
+    // Reset semantics: the return value is the number of frames dropped SINCE THE
+    // LAST CALL to this function, not a lifetime total — a second call with no
+    // further drops answers 0.
+    if (!instance) return 0;
+    auto* sender = reinterpret_cast<omt::Sender*>(instance);
+    return sender->recentDropsAndReset();
 }
 
 } // extern "C"

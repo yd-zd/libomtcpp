@@ -54,10 +54,10 @@ namespace MetadataConstants {
     constexpr const char* CHANNEL_PREVIEW_VIDEO_OFF = "<OMTSettings Preview=\"false\" />";
     
     // Tally commands
-    constexpr const char* TALLY_PREVIEW = "<OMTTally Preview=\"true\" Program==\"false\" />";
-    constexpr const char* TALLY_PROGRAM = "<OMTTally Preview=\"false\" Program==\"true\" />";
-    constexpr const char* TALLY_PREVIEWPROGRAM = "<OMTTally Preview=\"true\" Program==\"true\" />";
-    constexpr const char* TALLY_NONE = "<OMTTally Preview=\"false\" Program==\"false\" />";
+    constexpr const char* TALLY_PREVIEW = "<OMTTally Preview=\"true\" Program=\"false\" />";
+    constexpr const char* TALLY_PROGRAM = "<OMTTally Preview=\"false\" Program=\"true\" />";
+    constexpr const char* TALLY_PREVIEWPROGRAM = "<OMTTally Preview=\"true\" Program=\"true\" />";
+    constexpr const char* TALLY_NONE = "<OMTTally Preview=\"false\" Program=\"false\" />";
     
     // Quality suggestion prefix
     constexpr const char* SUGGESTED_QUALITY_PREFIX = "<OMTSettings Quality=";
@@ -105,7 +105,7 @@ enum class Quality {
 enum class FrameType : uint8_t {
     Metadata = 1,
     Video = 2,
-    Audio = 3
+    Audio = 4   // P0 #15: match libomtnet authority (was 3; audio unsupported anyway)
 };
 
 // Event types (for callbacks)
