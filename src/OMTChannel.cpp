@@ -7,18 +7,19 @@
 #include <cstdarg>
 #include <cstring>
 #include <cerrno>
-#ifdef _WIN32
-  #include "omt_os_win.h"   // full shim: this TU makes the socket calls
-#else
+#include <thread>
+#include <chrono>
+#include <string>
+#ifndef _WIN32
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
 #include <poll.h>
 #endif
-#include <thread>
-#include <chrono>
-#include <string>
+#ifdef _WIN32
+  #include "omt_os_win.h"   // full shim LAST: its errno/close macros must not leak into std headers
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
