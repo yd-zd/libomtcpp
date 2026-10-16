@@ -83,8 +83,17 @@ bool IsPeerGoneErrno(int e) {
 //
 // Returns WHY it stopped. Timeout is not failure of the peer, it is failure of the
 // budget; only PeerGone says anything about the peer.
+//
+// `peerGone` is the reader thread's verdict, published by Channel::markPeerGone()
+// when the kernel names the connection dead on the RECEIVE side (recv ECONNRESET,
+// a poll error, a frame the framer cannot parse). The writer must stop on it just
+// as it stops on `alive`: the peer is gone either way, and every extra 100 ms the
+// writer spends nursing a dead socket is 100 ms the channel cannot be reaped. It is
+// a separate flag from `alive` because `alive` (connected_) is the OBSERVABLE state
+// — only the writer may flip it, and only once it has filed every frame it owns.
 SendOutcome sendAllPoll(int fd, const uint8_t* data, size_t length,
-                        const std::atomic<bool>& alive, size_t& offset,
+                        const std::atomic<bool>& alive, const std::atomic<bool>& peerGone,
+                        size_t& offset,
                         int timeoutMs, int* errOut = nullptr) {
     auto report = [&](SendOutcome o, int err) {
         if (errOut) *errOut = err;
@@ -98,7 +107,7 @@ SendOutcome sendAllPoll(int fd, const uint8_t* data, size_t length,
     // used to cause: tearing the channel down for a peer that is merely slow.
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeoutMs);
-    while (offset < length && alive.load()) {
+    while (offset < length && alive.load() && !peerGone.load()) {
         if (std::chrono::steady_clock::now() >= deadline)
             return report(SendOutcome::Timeout, ETIMEDOUT);
         struct pollfd pfd{fd, POLLOUT, 0};
@@ -125,7 +134,7 @@ SendOutcome sendAllPoll(int fd, const uint8_t* data, size_t length,
         // a channel on an errno we do not understand.
     }
     if (offset >= length) return report(SendOutcome::Ok, 0);
-    return report(SendOutcome::Timeout, ETIMEDOUT);   // `alive` went false mid-write
+    return report(SendOutcome::Timeout, ETIMEDOUT);   // `alive` went false, or `peerGone` was raised, mid-write
 }
 
 // Build the on-the-wire bytes of one control (Metadata) frame: the 16-byte
@@ -331,6 +340,70 @@ void Channel::clearContinuationLocked() {
     continuationPending_ = false;
 }
 
+// File the frame the write pipeline still owns, then let it go. Called with
+// sendSocketMutex_ held by whoever is ending the channel, and ALWAYS before
+// connected_ can be observed false: a retained continuation is a write that began
+// and will never complete, so it is torn exactly once (Channel::countTorn is the
+// single site), and releasing it in the same breath is what stops the frame both
+// vanishing from the totals and being counted twice.
+void Channel::settleContinuationLocked() {
+    if (!continuationActive_) return;
+    countTorn(true, continuationIsVideo_);
+    clearContinuationLocked();
+}
+
+// End the channel from inside the writer's critical section. The caller holds
+// sendSocketMutex_ — the very lock senderLoop holds for as long as it owns a frame —
+// so the file-then-publish pair below is indivisible against the writer: no observer
+// can ever see a disconnected channel with the writer's frame in none of the buckets.
+void Channel::publishPeerGoneLocked() {
+    settleContinuationLocked();
+    peerGone_ = true;
+    connected_ = false;
+    queueCV_.notify_all();   // wakes markPeerGone()'s wait (predicate reads connected_ alone)
+}
+
+// The reader's verdict: the kernel named the connection dead on the RECEIVE side
+// (recv error, poll error, or a frame the framer cannot parse).
+//
+// This deliberately does NOT mark the channel disconnected, and that is the whole
+// point. The writer owns the in-flight frame and the terminal counters; a death
+// published from this thread would let an observer read isConnected() == false while
+// the frame the writer is holding sat in none of sent/dropped/torn — the exact hole
+// the ring-depth-4 window scenario measured (the reader's ECONNRESET landed first,
+// the writer's countTorn was still behind its own LOGE). Signal, wake the writer, and
+// let it file the frame and publish it itself. sendAllPoll stops on peerGone_ within
+// its poll tick, so the wait below is bounded by one bounded write, not by the peer;
+// if the writer has already exited, there is nobody left to do it and it happens here.
+//
+// Called ONLY from a non-writer thread (the receiver): it waits for the writer.
+void Channel::markPeerGone() {
+    peerGone_.store(true, std::memory_order_release);
+    {   // notify under the CV's mutex: signalling it unlocked can lose the wake-up
+        // against a writer that is between testing the predicate and going to sleep.
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        queueCV_.notify_all();
+    }
+    if (!senderLoopDone_.load(std::memory_order_acquire)) {
+        // Sliced, not one long wait_for: publishPeerGoneLocked() signals this CV from
+        // inside sendSocketMutex_ (it cannot take queueMutex_ there — see the lock
+        // order at the foot of senderLoop), so a wake-up can be lost against a writer
+        // between testing the predicate and sleeping. The 50 ms slice bounds that to
+        // a poll tick; the 8 s bound is one worst-case bounded write plus slack, and
+        // the fallback below is the same reap the writer would have done.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        std::unique_lock<std::mutex> lock(queueMutex_);
+        while (std::chrono::steady_clock::now() < deadline &&
+               connected_.load() && !senderLoopDone_.load(std::memory_order_acquire))
+            queueCV_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+                return !connected_.load() || senderLoopDone_.load(std::memory_order_acquire);
+            });
+    }
+    if (!connected_.load()) return;              // the writer got there first
+    std::lock_guard<std::mutex> wlock(sendSocketMutex_);
+    publishPeerGoneLocked();                     // writer is gone: reap here
+}
+
 void Channel::holdMetadataForRetry(std::vector<uint8_t> frame) {
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
@@ -373,7 +446,7 @@ SendOutcome Channel::flushContinuationLocked(int fd, int timeoutMs) {
     if (!continuationActive_) return SendOutcome::Ok;
     int err = 0;
     const SendOutcome o = sendAllPoll(fd, continuation_.data(), continuation_.size(),
-                                      connected_, continuationOffset_, timeoutMs, &err);
+                                      connected_, peerGone_, continuationOffset_, timeoutMs, &err);
     if (o == SendOutcome::Ok) {
         if (continuationIsVideo_) {
             // The frame was counted neither when it stalled nor twice now: this is
@@ -387,14 +460,19 @@ SendOutcome Channel::flushContinuationLocked(int fd, int timeoutMs) {
         return SendOutcome::Ok;
     }
     if (o == SendOutcome::PeerGone) {
+        // The half-written frame had BEGUN its write and will never finish it: torn,
+        // counted once here (metadata continuations are not in the video partition).
+        // The count goes FIRST, before the log line and before connected_ can be
+        // observed false: an observer that reads a disconnected channel must never
+        // be able to read a frame that is in none of the buckets (the totals-honest
+        // law the torn-write case measures).
+        countTorn(true, continuationIsVideo_);
         LOGE("channel %s:%d: peer gone (%s) while completing a half-written %s frame at %zu/%zu bytes",
              getRemoteAddress().c_str(), getRemotePort(), strerror(err),
              continuationIsVideo_ ? "video" : "metadata",
              continuationOffset_, continuation_.size());
+        peerGone_ = true;
         connected_ = false;   // under the write lock — see the P0 #7 note in sendMetadataSync
-        // The half-written frame had BEGUN its write and will never finish it: torn,
-        // counted once here (metadata continuations are not in the video partition).
-        countTorn(true, continuationIsVideo_);
         clearContinuationLocked();
         return SendOutcome::PeerGone;
     }
@@ -413,16 +491,23 @@ SendOutcome Channel::startFrameLocked(int fd, const uint8_t* data, size_t length
 
     size_t off = 0;
     int err = 0;
-    const SendOutcome o = sendAllPoll(fd, data, length, connected_, off, timeoutMs, &err);
+    const SendOutcome o = sendAllPoll(fd, data, length, connected_, peerGone_, off, timeoutMs, &err);
     if (o == SendOutcome::Ok) {
         warnedWrite_[isVideo ? 0 : 1].store(false, std::memory_order_relaxed);
         noteProgress();
         return SendOutcome::Ok;
     }
     if (o == SendOutcome::PeerGone) {
+        // The frame in hand was attempted and the socket refused it: its write BEGAN
+        // and will never complete, so it is the torn bucket — filed HERE, before the
+        // log line and before connected_ can be observed false, and NOT again by the
+        // caller. A reader that can see a disconnected channel therefore can never
+        // see this frame missing from the totals (the totals-honest law).
+        countTorn(true, isVideo);
         LOGE("channel %s:%d: peer gone (%s) after %zu/%zu bytes of a %s frame",
              getRemoteAddress().c_str(), getRemotePort(), strerror(err), off, length,
              isVideo ? "video" : "metadata");
+        peerGone_ = true;
         connected_ = false;   // under the write lock, before any waiter can proceed
         clearContinuationLocked();
         return SendOutcome::PeerGone;
@@ -660,7 +745,8 @@ void Channel::senderLoop() {
             std::unique_lock<std::mutex> lock(queueMutex_);
             queueCV_.wait_for(lock, std::chrono::milliseconds(100), [this] {
                 return !pendingQueue_.empty() || !running_ || !connected_
-                       || pendingMetadataActive_ || continuationPending_.load();
+                       || pendingMetadataActive_ || continuationPending_.load()
+                       || peerGone_.load();
             });
             
             if (!running_ || !connected_) break;
@@ -699,7 +785,11 @@ void Channel::senderLoop() {
                 const int64_t idleUs = SteadyUs() - progressUs_.load(std::memory_order_relaxed);
                 stalledOut = idleUs > static_cast<int64_t>(budgets_.stalledPeerMs) * 1000;
             }
-            if (!haveWork) continue;   // idle tick, nothing pending anywhere
+            // An idle tick with nothing pending anywhere is not a reason to end the
+            // channel — UNLESS the reader has already heard the kernel say the peer is
+            // gone. Only the writer may publish that (see Channel::markPeerGone), so
+            // fall through and let the block below reap it.
+            if (!haveWork && !peerGone_.load()) continue;
         }
 
         if (stalledOut) {
@@ -709,7 +799,23 @@ void Channel::senderLoop() {
             warnOnce(3, "no byte of ours reached the socket for %d ms while %s was queued; "
                        "treating the peer as gone",
                      budgets_.stalledPeerMs, haveMeta ? "metadata" : "video");
-            connected_ = false;
+            // The reap goes through the write lock, and the lock is what makes the
+            // accounting precede the announcement: a continuation retained from an
+            // earlier tick is still live at this point, and an observer must not be
+            // able to read the channel as gone while that frame is in no counter.
+            {
+                std::lock_guard<std::mutex> wlock(sendSocketMutex_);
+                publishPeerGoneLocked();
+            }
+            break;
+        }
+
+        if (!haveWork) {
+            // The reader's verdict, with nothing left to attempt: no frame is in the
+            // writer's hands, so it just ends the channel (under the same lock, for
+            // the same reason).
+            std::lock_guard<std::mutex> wlock(sendSocketMutex_);
+            publishPeerGoneLocked();
             break;
         }
 
@@ -738,9 +844,12 @@ void Channel::senderLoop() {
                     // so it claims bufWritten here WITHOUT a counter, or the release
                     // below would file it as a drop it is not. A frame the connection
                     // died under had BEGUN its write: that is the torn bucket, disjoint
-                    // from dropped (test-line accounting, on wt3's pipeline).
+                    // from dropped, and startFrameLocked files it there itself — before
+                    // it may let anyone observe the channel disconnected, which is why
+                    // the count is not repeated on this line (test-line accounting, on
+                    // wt3's pipeline).
                     if (outcome == SendOutcome::Ok) { framesSent_++; bytesSent_ += len; bufWritten = true; }
-                    else if (outcome == SendOutcome::PeerGone) { countTorn(true, true); bufWritten = true; }
+                    else if (outcome == SendOutcome::PeerGone) { bufWritten = true; }
                     else { bufWritten = true; }   // Timeout: retained, counted on completion/death
                 } else if (outcome == SendOutcome::Ok && haveMeta) {
                     ++metadataAttempts_;
@@ -755,6 +864,14 @@ void Channel::senderLoop() {
                 (void)outcome;   // PeerGone already cleared connected_ inside the locked helpers
             }
             if (buf && !bufWritten) bufLost = true;   // never even started: the stream was busy
+
+            // The reader may have heard the kernel name the connection dead while this
+            // iteration owned the frame. End the channel HERE: still inside the write
+            // lock, and after every count above has landed. settleContinuationLocked()
+            // files a frame the Timeout branch retained as torn, so no observer can
+            // read the channel as gone while the frame the writer held is in none of
+            // sent / dropped / torn.
+            if (peerGone_.load(std::memory_order_acquire)) publishPeerGoneLocked();
         }
         wlock.unlock();
         // Every acquired buffer is released exactly once, on every path — a buffer stranded
@@ -769,17 +886,20 @@ void Channel::senderLoop() {
         if (!keepWriting) break;
     }
     
-    // The loop is over. A video frame still retained as the continuation began its
-    // write and will never complete it — the stalled-out and socket-gone breaks leave
-    // here with the continuation LIVE, and no PeerGone counter ever ran for it. This
-    // is the single exit for an abandoned write: count it torn once, then release it
-    // (~Channel's own clear below then finds nothing and cannot double-count).
+    // The loop is over, therefore so is the channel. A video frame still retained as
+    // the continuation began its write and will never complete it — the stalled-out and
+    // socket-gone breaks leave here with the continuation LIVE, and no PeerGone counter
+    // ever ran for it. This is the single exit for an abandoned write: count it torn
+    // once, then release it (~Channel's own clear below then finds nothing and cannot
+    // double-count). Marking disconnected here is what lets a receiver parked in
+    // markPeerGone() know the writer has finished filing, and lets a channel the
+    // teardown stopped (running_ went false) be seen as over too.
     {
         std::lock_guard<std::mutex> wlock(sendSocketMutex_);
-        if (continuationActive_) {
-            countTorn(true, continuationIsVideo_);
-            clearContinuationLocked();
-        }
+        settleContinuationLocked();
+        connected_ = false;
+        senderLoopDone_.store(true, std::memory_order_release);
+        queueCV_.notify_all();
     }
 
     LOGI("senderLoop: exiting");
@@ -801,7 +921,7 @@ void Channel::receiverLoop() {
         int sel = ::poll(&pfd, 1, 100);  // 100ms tick
         if (sel < 0) {
             if (errno == EINTR) continue;
-            connected_ = false;
+            markPeerGone();   // the socket itself is unusable: see Channel::markPeerGone
             break;
         }
         
@@ -812,7 +932,7 @@ void Channel::receiverLoop() {
         // rejected at parse time) or we failed to drain — treat as malformed.
         if (bufferPos >= recvBuffer.size()) {
             LOGE("receiverLoop: receive buffer full (%zu) without a consumable frame", bufferPos);
-            connected_ = false;
+            markPeerGone();
             break;
         }
         ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
@@ -827,7 +947,7 @@ void Channel::receiverLoop() {
         }
         if (received < 0) {
             LOGE("receiverLoop: recv error %d", errno);
-            connected_ = false;
+            markPeerGone();   // ECONNRESET/EPIPE from the kernel: the peer is gone
             break;
         }
         if (received == 0) {
@@ -863,7 +983,7 @@ void Channel::receiverLoop() {
             const uint8_t ft = header.frameType;
             if (header.version != 1) {
                 LOGE("receiverLoop: invalid version %u", header.version);
-                connected_ = false;
+                markPeerGone();
                 break;
             }
             // This is the SENDER's receive path: it only accepts Metadata control
@@ -871,24 +991,24 @@ void Channel::receiverLoop() {
             // here are malformed for this direction — reject rather than parse.
             if (ft != static_cast<uint8_t>(FrameType::Metadata)) {
                 LOGE("receiverLoop: unexpected peer frameType %u", ft);
-                connected_ = false;
+                markPeerGone();
                 break;
             }
             if (header.dataLength < 0) {
                 LOGE("receiverLoop: negative dataLength %d", header.dataLength);
-                connected_ = false;
+                markPeerGone();
                 break;
             }
             if (header.dataLength > kMaxControlPayload) {
                 LOGE("receiverLoop: oversized control frame dataLength %d", header.dataLength);
-                connected_ = false;
+                markPeerGone();
                 break;
             }
             // metadataLength is uint16 and must fit inside dataLength.
             if (static_cast<int32_t>(header.metadataLength) > header.dataLength) {
                 LOGE("receiverLoop: metadataLength %u > dataLength %d",
                      header.metadataLength, header.dataLength);
-                connected_ = false;
+                markPeerGone();
                 break;
             }
 

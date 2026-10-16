@@ -266,6 +266,17 @@ private:
     // 75s x 9 probes before it errors anything) is far too slow to be the bound.
     std::atomic<int64_t> progressUs_{0};
 
+    // The reader thread's verdict, NOT the observable state. connected_ is what the
+    // node, the sender and the QA harnesses read, and the writer is the only thread
+    // allowed to flip it: it owns the in-flight frame and the terminal counters, and
+    // a death published by anybody else could be observed while that frame was still
+    // in none of sent/dropped/torn. The reader sets THIS instead (markPeerGone), the
+    // writer stops its bounded write on it and then publishes connected_ itself.
+    std::atomic<bool> peerGone_{false};
+    // True once senderLoop has filed every frame it owned and left. Lets markPeerGone
+    // know there is no writer left to hand the reap to.
+    std::atomic<bool> senderLoopDone_{false};
+
     // Log-once-per-storm, per kind: 0 = video write, 1 = metadata write,
     // 2 = socket-write-lock budget, 3 = stalled-peer reap. The live failure was
     // 802 identical warning lines in three minutes; a warning that repeats once
@@ -352,6 +363,17 @@ private:
     SendOutcome startFrameLocked(int fd, const uint8_t* data, size_t length,
                                  bool isVideo, int timeoutMs);
     void clearContinuationLocked();
+    // File the frame the write pipeline still owns (torn, once) and release it.
+    // sendSocketMutex_ held.
+    void settleContinuationLocked();
+    // End the channel from inside sendSocketMutex_: settle, then publish the death,
+    // in that order and indivisibly — no observer may read a disconnected channel
+    // whose last frame is in none of the counters.
+    void publishPeerGoneLocked();
+    // The reader thread's peer-is-gone verdict. It signals peerGone_ and lets the
+    // writer publish connected_; it only reaps directly if the writer has already
+    // exited. NEVER call it from the writer thread (it waits for that thread).
+    void markPeerGone();
     // Install `frame` into the single waiting-metadata slot (newest wins). Takes
     // queueMutex_ itself, so callers must hold NO lock.
     void holdMetadataForRetry(std::vector<uint8_t> frame);
