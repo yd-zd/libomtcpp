@@ -565,6 +565,7 @@ bool Sender::ensureEncoderLocked(int width, int height, int colorSpace) {
 // P0 #8 (Codex): encode under the (already-held) encoderMutex_ and copy the
 // completed bytes into an OWNED payload so the shared encodeBuffer_ is never
 // read after the lock is released. Returns encoded length (0 = failure).
+// Reuses a thread-local buffer to avoid steady-state heap allocations per frame.
 int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out) {
     if (!vmxInstance_) return 0;
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
@@ -601,7 +602,10 @@ int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out
         LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, encodeBuffer_.size());
         return 0;
     }
-    out.assign(encodeBuffer_.begin(), encodeBuffer_.begin() + encodedLen);
+
+    // Reuse buffer capacity without reallocating heap memory in steady state
+    out.resize(static_cast<size_t>(encodedLen));
+    std::memcpy(out.data(), encodeBuffer_.data(), static_cast<size_t>(encodedLen));
     return encodedLen;
 }
 
@@ -623,13 +627,14 @@ int Sender::send(const MediaFrame& frame) {
     // single encoderMutex_ hold; the payload is owned locally so a concurrent
     // quality callback (destroyEncoder) or second producer cannot mix
     // dimensions/headers/payload. Congestion/quality decisions run AFTER.
-    std::vector<uint8_t> payload;
+    // Thread-local scratch buffer eliminates steady-state heap allocations per frame.
+    thread_local std::vector<uint8_t> t_payloadBuffer;
     int encodedLen = 0;
     {
         std::lock_guard<std::mutex> lock(encoderMutex_);
         if (!ensureEncoderLocked(frame.width, frame.height, frame.colorSpace))
             return 0;
-        encodedLen = encodeFrameLocked(frame, payload);
+        encodedLen = encodeFrameLocked(frame, t_payloadBuffer);
     }
     if (encodedLen <= 0) return 0;
     
@@ -675,7 +680,7 @@ int Sender::send(const MediaFrame& frame) {
             
             int sent = ch->sendAsync(&header, sizeof(header),
                                      &extHeader, sizeof(extHeader),
-                                     payload.data(), encodedLen);
+                                     t_payloadBuffer.data(), encodedLen);
             if (sent > 0) {
                 totalSent += sent;
             }
