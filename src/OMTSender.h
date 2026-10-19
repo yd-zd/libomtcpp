@@ -109,7 +109,7 @@ struct SenderConfig {
     // SenderConfig::senderInfoXml or Sender::setSenderInfo(), which is what the node calls.
     // Proven at the wire, not by grepping this header: qa-ompin/wire-slow-reader.cpp case
     // sender-identity connects a real peer and asserts what actually arrived.
-    std::string senderInfoXml = "<OMTInfo ProductName=\"nodos OmpOut\" Manufacturer=\"Nodos\" Version=\"1.0\" />";
+    std::string senderInfoXml = "<OMTInfo ProductName=\"nodos OmtOut\" Manufacturer=\"Nodos\" Version=\"1.0\" />";
 };
 
 /**
