@@ -277,19 +277,21 @@ void Sender::removeChannel(Channel* channel) {
 
 namespace {
 
-// Scratch-buffer policy shared by the encode paths: resized to `need` without
-// reallocating in steady state, and memory is RELEASED only when the
-// requirement has fallen far below the retained block (a resolution drop), so
-// a sending thread keeps one right-sized block instead of per-frame
-// allocations or a forever-max-high-water mark. 4x + 8 MiB hysteresis keeps
-// the shrink from ever thrashing between nearby resolutions.
+// Scratch-buffer policy shared by the encode paths: grown to `need` without
+// reallocating in steady state; the size is NEVER shrunk after a frame,
+// because a later grow-back would value-initialize (memset) the whole block —
+// measured as a 2x send() regression at 4K in the zero-copy draft this
+// distilled from. Consumers take data() + explicit length, so the trailing
+// bytes past the published frame are simply dead until overwritten. Memory is
+// RELEASED only when the requirement has fallen far below the retained block
+// (a resolution drop): 4x + 8 MiB hysteresis prevents thrashing.
 void ensureScratch(std::vector<uint8_t>& buf, size_t need) {
     if (buf.capacity() < need) {
         buf.reserve(need);
     } else if (buf.capacity() >= need * 4u && buf.capacity() - need >= (size_t(8) << 20)) {
         std::vector<uint8_t> fresh;
         fresh.reserve(need);
-        buf.swap(fresh);
+        buf.swap(fresh);   // one-time; the single resize below re-zeroes once
     }
     if (buf.size() < need) buf.resize(need);
 }
@@ -633,7 +635,9 @@ int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out
         LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, out.size());
         return 0;
     }
-    out.resize(encodedLen);   // size = published length; capacity stays for reuse
+    // Deliberately NOT out.resize(encodedLen): shrinking the size would make
+    // the next frame's grow-back zero the whole scratch (see ensureScratch).
+    // Callers consume data() + encodedLen.
     return encodedLen;
 }
 
