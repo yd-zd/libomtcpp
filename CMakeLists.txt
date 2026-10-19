@@ -46,7 +46,7 @@ target_include_directories(omt
 
 # VMX includes and linking
 if(VMX_ROOT)
-    target_include_directories(omt PRIVATE ${VMX_ROOT}/include)
+    target_include_directories(omt PRIVATE ${VMX_ROOT}/include ${VMX_ROOT}/src)
     
     # Find VMX library
     find_library(VMX_LIBRARY

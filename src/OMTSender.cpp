@@ -5,7 +5,7 @@
 
 #include "OMTSender.h"
 #include "OMTProtocol.h"
-#include "../../libvmx/src/vmxcodec.h"
+#include "vmxcodec.h"
 
 #include <cstring>
 #include <algorithm>
@@ -275,10 +275,11 @@ void Sender::removeChannel(Channel* channel) {
     }
 }
 
-void Sender::cleanupDisconnected() {
+int Sender::cleanupDisconnected() {
     // P0 #4 (Codex): collect disconnected channels into a local owning vector
     // under the lock, then destroy (join) them after releasing it.
     std::vector<std::unique_ptr<Channel>> retiring;
+    int activeCount = 0;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
         for (auto it = channels_.begin(); it != channels_.end(); ) {
@@ -296,7 +297,9 @@ void Sender::cleanupDisconnected() {
                 ++it;
             }
         }
+        activeCount = static_cast<int>(channels_.size());
     }
+    return activeCount;
 }
 
 int Sender::connectionCount() const {
@@ -409,10 +412,6 @@ void Sender::createEncoder(int width, int height, int frameRate, int colorSpace)
     currentWidth_ = width;
     currentHeight_ = height;
     
-    int maxSize = width * height * 4;
-    if (maxSize < 1024 * 1024) maxSize = 1024 * 1024;
-    encodeBuffer_.resize(maxSize);
-    
     LOGI("Encoder created: %dx%d, profile=%d", width, height, static_cast<int>(currentProfile_));
 }
 
@@ -472,7 +471,13 @@ int Sender::encodeFrame(const MediaFrame& frame) {
         return 0;
     }
     
-    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), encodeBuffer_.size());
+    thread_local std::vector<uint8_t> s_encodeFrameBuf;
+    int maxSize = frame.width * frame.height * 4;
+    if (maxSize < 1024 * 1024) maxSize = 1024 * 1024;
+    if (s_encodeFrameBuf.size() < static_cast<size_t>(maxSize)) {
+        s_encodeFrameBuf.resize(maxSize);
+    }
+    int encodedLen = VMX_SaveTo(vmxInstance_, s_encodeFrameBuf.data(), static_cast<int>(s_encodeFrameBuf.size()));
     return encodedLen;
 }
 
@@ -554,17 +559,14 @@ bool Sender::ensureEncoderLocked(int width, int height, int colorSpace) {
     currentWidth_ = width;
     currentHeight_ = height;
     currentColorSpace_ = colorSpace;
-    uint64_t maxSize64 = (uint64_t)width * (uint64_t)height * 4u;
-    if (maxSize64 < (1024u * 1024u)) maxSize64 = 1024u * 1024u;
-    if (maxSize64 > (uint64_t)std::numeric_limits<size_t>::max()) return false;
-    encodeBuffer_.resize((size_t)maxSize64);
     LOGI("Encoder created: %dx%d cs=%d profile=%d", width, height, colorSpace, currentProfile_);
     return true;
 }
 
-// P0 #8 (Codex): encode under the (already-held) encoderMutex_ and copy the
-// completed bytes into an OWNED payload so the shared encodeBuffer_ is never
-// read after the lock is released. Returns encoded length (0 = failure).
+// P0 #8 (Codex): encode under the (already-held) encoderMutex_ directly into `out`
+// (a thread-local reusable payload buffer) so no steady-state heap allocations or
+// redundant payload copies occur, while ensuring the payload remains fully isolated
+// from concurrent profile changes.
 int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out) {
     if (!vmxInstance_) return 0;
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
@@ -594,22 +596,28 @@ int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out
         default: LOGE("Unknown codec: 0x%08X", frame.codec); return 0;
     }
     if (err != VMX_ERR_OK) { LOGE("VMX encode failed: %d", err); return 0; }
-    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), encodeBuffer_.size());
-    // P0 #10 (Codex): a capacity/arg failure returns 0 or a bogus positive; a
-    // publishable frame must be >0 and within the buffer we actually own.
-    if (encodedLen <= 0 || (size_t)encodedLen > encodeBuffer_.size()) {
-        LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, encodeBuffer_.size());
+
+    uint64_t maxSize64 = (uint64_t)frame.width * (uint64_t)frame.height * 4u;
+    if (maxSize64 < (1024u * 1024u)) maxSize64 = 1024u * 1024u;
+    if (maxSize64 > (uint64_t)std::numeric_limits<size_t>::max()) return 0;
+    size_t maxSize = static_cast<size_t>(maxSize64);
+
+    if (out.size() < maxSize) {
+        out.resize(maxSize);
+    }
+
+    int encodedLen = VMX_SaveTo(vmxInstance_, out.data(), static_cast<int>(out.size()));
+    if (encodedLen <= 0 || static_cast<size_t>(encodedLen) > out.size()) {
+        LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, out.size());
         return 0;
     }
-    out.assign(encodeBuffer_.begin(), encodeBuffer_.begin() + encodedLen);
+    out.resize(encodedLen);
     return encodedLen;
 }
 
 int Sender::send(const MediaFrame& frame) {
-    // Cleanup disconnected first
-    cleanupDisconnected();
-    
-    if (connectionCount() == 0) return 1;  // No clients, but not an error
+    // Cleanup disconnected channels and check connection count in a single lock acquisition
+    if (cleanupDisconnected() == 0) return 1;  // No clients, but not an error
     
     // P0 #9: validate input before touching the encoder or VMX.
     if (!validateFrame(frame)) {
@@ -619,17 +627,16 @@ int Sender::send(const MediaFrame& frame) {
         return 0;
     }
     
-    // P0 #8: encoder-select + encode + payload-copy as ONE transaction under a
-    // single encoderMutex_ hold; the payload is owned locally so a concurrent
-    // quality callback (destroyEncoder) or second producer cannot mix
-    // dimensions/headers/payload. Congestion/quality decisions run AFTER.
-    std::vector<uint8_t> payload;
+    // Thread-local reusable payload buffer to eliminate steady-state heap allocations
+    // and redundant frame payload memory copies across calls.
+    thread_local std::vector<uint8_t> s_payloadBuffer;
+
     int encodedLen = 0;
     {
         std::lock_guard<std::mutex> lock(encoderMutex_);
         if (!ensureEncoderLocked(frame.width, frame.height, frame.colorSpace))
             return 0;
-        encodedLen = encodeFrameLocked(frame, payload);
+        encodedLen = encodeFrameLocked(frame, s_payloadBuffer);
     }
     if (encodedLen <= 0) return 0;
     
@@ -662,8 +669,8 @@ int Sender::send(const MediaFrame& frame) {
     extHeader.flags = frame.flags;
     extHeader.colorSpace = frame.colorSpace;
     
-    // Send to all subscribed clients — uses the OWNED payload, not the shared
-    // encodeBuffer_ (which is no longer stable once encoderMutex_ was released).
+    // Send to all subscribed clients — uses thread_local s_payloadBuffer, which is owned
+    // by the calling thread during sendAsync dispatch and safe from concurrent quality callbacks.
     int totalSent = 0;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
@@ -675,7 +682,7 @@ int Sender::send(const MediaFrame& frame) {
             
             int sent = ch->sendAsync(&header, sizeof(header),
                                      &extHeader, sizeof(extHeader),
-                                     payload.data(), encodedLen);
+                                     s_payloadBuffer.data(), encodedLen);
             if (sent > 0) {
                 totalSent += sent;
             }
