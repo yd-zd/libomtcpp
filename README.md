@@ -15,6 +15,10 @@ Provides TCP transport, VMX video encoding, and multi-client sender functionalit
 - C API for integration with native applications
 - Android NDK support
 
+## Used by
+
+[Nodos OMT](https://github.com/yd-zd/nodos-omt) uses libomtcpp for native OMT video output. Its integration tests exercise the sender, channel lifecycle, and wire protocol on Windows and Linux.
+
 ## Requirements
 
 - C++17 compiler
