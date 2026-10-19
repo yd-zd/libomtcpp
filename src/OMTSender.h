@@ -265,7 +265,6 @@ private:
     int currentHeight_ = 0;
     int currentProfile_ = 0;  // VMX_PROFILE stored as int
     int currentColorSpace_ = 0;  // P0 #8: encoder cache key includes colorspace
-    std::vector<uint8_t> encodeBuffer_;
     mutable std::mutex encoderMutex_;  // P0 #8: mutable so const getters can lock it
     
     // Statistics
@@ -285,7 +284,7 @@ private:
     // Add/remove channels
     void addChannel(std::unique_ptr<Channel> channel);
     void removeChannel(Channel* channel);
-    void cleanupDisconnected();
+    int cleanupDisconnected();
     
     // Encoder management
     void createEncoder(int width, int height, int frameRate, int colorSpace);

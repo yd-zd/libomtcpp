@@ -5,7 +5,7 @@
 
 #include "OMTSender.h"
 #include "OMTProtocol.h"
-#include "../../libvmx/src/vmxcodec.h"
+#include "vmxcodec.h"
 
 #include <cstring>
 #include <algorithm>
@@ -275,10 +275,34 @@ void Sender::removeChannel(Channel* channel) {
     }
 }
 
-void Sender::cleanupDisconnected() {
+namespace {
+
+// Scratch-buffer policy shared by the encode paths: resized to `need` without
+// reallocating in steady state, and memory is RELEASED only when the
+// requirement has fallen far below the retained block (a resolution drop), so
+// a sending thread keeps one right-sized block instead of per-frame
+// allocations or a forever-max-high-water mark. 4x + 8 MiB hysteresis keeps
+// the shrink from ever thrashing between nearby resolutions.
+void ensureScratch(std::vector<uint8_t>& buf, size_t need) {
+    if (buf.capacity() < need) {
+        buf.reserve(need);
+    } else if (buf.capacity() >= need * 4u && buf.capacity() - need >= (size_t(8) << 20)) {
+        std::vector<uint8_t> fresh;
+        fresh.reserve(need);
+        buf.swap(fresh);
+    }
+    if (buf.size() < need) buf.resize(need);
+}
+
+} // namespace
+
+int Sender::cleanupDisconnected() {
     // P0 #4 (Codex): collect disconnected channels into a local owning vector
-    // under the lock, then destroy (join) them after releasing it.
+    // under the lock, then destroy (join) them after releasing it. Returns the
+    // number of channels still connected, so callers retire channels and test
+    // for subscribers in ONE channelsMutex_ pass.
     std::vector<std::unique_ptr<Channel>> retiring;
+    int activeCount = 0;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
         for (auto it = channels_.begin(); it != channels_.end(); ) {
@@ -296,7 +320,9 @@ void Sender::cleanupDisconnected() {
                 ++it;
             }
         }
+        activeCount = static_cast<int>(channels_.size());
     }
+    return activeCount;
 }
 
 int Sender::connectionCount() const {
@@ -409,10 +435,6 @@ void Sender::createEncoder(int width, int height, int frameRate, int colorSpace)
     currentWidth_ = width;
     currentHeight_ = height;
     
-    int maxSize = width * height * 4;
-    if (maxSize < 1024 * 1024) maxSize = 1024 * 1024;
-    encodeBuffer_.resize(maxSize);
-    
     LOGI("Encoder created: %dx%d, profile=%d", width, height, static_cast<int>(currentProfile_));
 }
 
@@ -472,8 +494,15 @@ int Sender::encodeFrame(const MediaFrame& frame) {
         return 0;
     }
     
-    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), encodeBuffer_.size());
-    return encodedLen;
+    // Encode into a reused thread-local scratch (same policy as the locked
+    // path; uint64 size math kept consistent with it). This legacy overload is
+    // currently unreferenced by the node but stays allocation-free too.
+    thread_local std::vector<uint8_t> scratch;
+    uint64_t maxSize64 = (uint64_t)frame.width * (uint64_t)frame.height * 4u;
+    if (maxSize64 < (1024u * 1024u)) maxSize64 = 1024u * 1024u;
+    if (maxSize64 > (uint64_t)std::numeric_limits<size_t>::max()) return 0;
+    ensureScratch(scratch, (size_t)maxSize64);
+    return VMX_SaveTo(vmxInstance_, scratch.data(), (int)scratch.size());
 }
 
 // P0 #9 (Codex): reject out-of-range dimensions/stride/length BEFORE any
@@ -554,17 +583,16 @@ bool Sender::ensureEncoderLocked(int width, int height, int colorSpace) {
     currentWidth_ = width;
     currentHeight_ = height;
     currentColorSpace_ = colorSpace;
-    uint64_t maxSize64 = (uint64_t)width * (uint64_t)height * 4u;
-    if (maxSize64 < (1024u * 1024u)) maxSize64 = 1024u * 1024u;
-    if (maxSize64 > (uint64_t)std::numeric_limits<size_t>::max()) return false;
-    encodeBuffer_.resize((size_t)maxSize64);
     LOGI("Encoder created: %dx%d cs=%d profile=%d", width, height, colorSpace, currentProfile_);
     return true;
 }
 
-// P0 #8 (Codex): encode under the (already-held) encoderMutex_ and copy the
-// completed bytes into an OWNED payload so the shared encodeBuffer_ is never
-// read after the lock is released. Returns encoded length (0 = failure).
+// P0 #8 (Codex): encode under the (already-held) encoderMutex_ DIRECTLY into
+// `out`, the caller-owned scratch, so there is no intermediate buffer and no
+// second copy of the compressed frame. `out` is only read by the caller on
+// this thread; Channel::sendAsync copies bytes into pooled buffers before it
+// returns, so reuse of the scratch cannot overlap an in-flight frame.
+// Returns encoded length (0 = failure).
 int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out) {
     if (!vmxInstance_) return 0;
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
@@ -594,22 +622,24 @@ int Sender::encodeFrameLocked(const MediaFrame& frame, std::vector<uint8_t>& out
         default: LOGE("Unknown codec: 0x%08X", frame.codec); return 0;
     }
     if (err != VMX_ERR_OK) { LOGE("VMX encode failed: %d", err); return 0; }
-    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), encodeBuffer_.size());
+    uint64_t maxSize64 = (uint64_t)frame.width * (uint64_t)frame.height * 4u;
+    if (maxSize64 < (1024u * 1024u)) maxSize64 = 1024u * 1024u;
+    if (maxSize64 > (uint64_t)std::numeric_limits<size_t>::max()) return 0;
+    ensureScratch(out, (size_t)maxSize64);
+    int encodedLen = VMX_SaveTo(vmxInstance_, out.data(), (int)out.size());
     // P0 #10 (Codex): a capacity/arg failure returns 0 or a bogus positive; a
     // publishable frame must be >0 and within the buffer we actually own.
-    if (encodedLen <= 0 || (size_t)encodedLen > encodeBuffer_.size()) {
-        LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, encodeBuffer_.size());
+    if (encodedLen <= 0 || (size_t)encodedLen > out.size()) {
+        LOGE("VMX_SaveTo bad length %d (cap %zu)", encodedLen, out.size());
         return 0;
     }
-    out.assign(encodeBuffer_.begin(), encodeBuffer_.begin() + encodedLen);
+    out.resize(encodedLen);   // size = published length; capacity stays for reuse
     return encodedLen;
 }
 
 int Sender::send(const MediaFrame& frame) {
-    // Cleanup disconnected first
-    cleanupDisconnected();
-    
-    if (connectionCount() == 0) return 1;  // No clients, but not an error
+    // Retire disconnected channels and test for subscribers in one lock pass.
+    if (cleanupDisconnected() == 0) return 1;  // No clients, but not an error
     
     // P0 #9: validate input before touching the encoder or VMX.
     if (!validateFrame(frame)) {
@@ -623,7 +653,7 @@ int Sender::send(const MediaFrame& frame) {
     // single encoderMutex_ hold; the payload is owned locally so a concurrent
     // quality callback (destroyEncoder) or second producer cannot mix
     // dimensions/headers/payload. Congestion/quality decisions run AFTER.
-    std::vector<uint8_t> payload;
+    thread_local std::vector<uint8_t> payload;   // reused scratch; see sendAsync note
     int encodedLen = 0;
     {
         std::lock_guard<std::mutex> lock(encoderMutex_);
@@ -662,8 +692,9 @@ int Sender::send(const MediaFrame& frame) {
     extHeader.flags = frame.flags;
     extHeader.colorSpace = frame.colorSpace;
     
-    // Send to all subscribed clients — uses the OWNED payload, not the shared
-    // encodeBuffer_ (which is no longer stable once encoderMutex_ was released).
+    // Send to all subscribed clients. The payload is this thread's reused
+    // scratch: safe because sendAsync copies into pooled buffers before
+    // returning, so the next frame's overwrite cannot touch an in-flight one.
     int totalSent = 0;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
