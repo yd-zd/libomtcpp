@@ -32,7 +32,7 @@ class GpuSubmissionTracker {
 public:
     using CompleteFn = std::function<bool(const Record&)>;
 
-    explicit GpuSubmissionTracker(std::size_t cap) : cap_(cap) {}
+    explicit GpuSubmissionTracker(std::size_t cap) : cap_(cap) { records_.reserve(cap); }
 
     // True while there is room to submit another readback. The caller checks this
     // BEFORE allocating/dispatching; at capacity it must stall (not submit).
